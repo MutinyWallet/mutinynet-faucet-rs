@@ -1,17 +1,10 @@
-
-
-
 use lightning_invoice::Invoice;
 use serde::{Deserialize, Serialize};
-use tokio::task;
-use std::{env, str::FromStr};
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
-use tonic_lnd::{LightningClient};
 
-use crate::{MAX_SEND_AMOUNT, AppState};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+
+use crate::{AppState, MAX_SEND_AMOUNT};
 
 #[derive(Clone, Deserialize)]
 pub struct LightningRequest {
@@ -27,9 +20,8 @@ pub async fn pay_lightning(
     state: Arc<Mutex<AppState>>,
     payload: LightningRequest,
 ) -> anyhow::Result<String> {
-
     if let Ok(invoice) = Invoice::from_str(&payload.bolt11) {
-        if let Some(msat_amount) = invoice.amount_milli_satoshis(){
+        if let Some(msat_amount) = invoice.amount_milli_satoshis() {
             if msat_amount / 1000 > MAX_SEND_AMOUNT {
                 anyhow::bail!("max amount is 1,000,000");
             }
@@ -56,14 +48,14 @@ pub async fn pay_lightning(
             .await?
             .into_inner();
 
-        if response.payment_error != "" {
+        if !response.payment_error.is_empty() {
             return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
         }
 
         response.payment_hash
     };
 
-    let hex_payment_hash = hex::encode(payment_hash.clone());
+    let hex_payment_hash = hex::encode(payment_hash);
 
     Ok(hex_payment_hash)
 }
