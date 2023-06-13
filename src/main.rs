@@ -5,80 +5,54 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use bitcoin::{Amount, Address};
+use bitcoincore_rpc::{
+    Auth, Client, RpcApi,
+};
+use lightning_invoice::Invoice;
 use serde::{Deserialize, Serialize};
-use std::env;
+use tokio::task;
+use std::{env, str::FromStr};
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex},
 };
-use tonic_lnd::{LightningClient, lnrpc::payment};
+use tonic_lnd::{LightningClient};
 
-#[derive(Clone, Deserialize)]
-struct OnchainRequest {
-    sats: u64,
-    address: String,
-}
+mod onchain;
+mod lightning;
+mod setup;
 
-#[derive(Serialize)]
-struct OnchainResponse {
-    txid: String,
-}
+use setup::setup;
 
-#[derive(Clone, Deserialize)]
-struct LightningRequest {
-    bolt11: String,
-}
+use onchain::pay_onchain;
+use lightning::pay_lightning;
 
-#[derive(Serialize)]
-struct LightningResponse {
-    pop: String,
-}
+use crate::{onchain::{OnchainRequest, OnchainResponse}, lightning::{LightningRequest, LightningResponse}};
 
-struct AppState {
+pub struct AppState {
+    network: bitcoin::Network,
     lightning_client: LightningClient,
+    bitcoin_client: Arc<Client>,
 }
 
 impl AppState {
-    pub fn new(client: LightningClient) -> Self {
+    pub fn new(lightning_client: LightningClient, bitcoin_client: Client, network: bitcoin::Network) -> Self {
         AppState {
-            lightning_client: client,
+            network,
+            lightning_client,
+            bitcoin_client: Arc::new(bitcoin_client),
         }
     }
 }
-// unsafe impl Send for AppState {}
 
 type SharedState = Arc<Mutex<AppState>>;
 
+const MAX_SEND_AMOUNT: u64 = 1_000_000;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load environment variables from various sources.
-    dotenv::from_filename(".env.local").ok();
-    dotenv::from_filename(".env").ok();
-    dotenv::dotenv().ok();
-
-    let address = env::var("GRPC_HOST").expect("missing GRPC_HOST");
-    let macaroon_file = env::var("ADMIN_MACAROON_PATH").expect("missing ADMIN_MACAROON_PATH");
-    let cert_file = env::var("TLS_CERT_PATH").expect("missing TLS_CERT_PATH");
-    let port: u32 = env::var("GRPC_PORT")
-        .expect("missing GRPC_PORT")
-        .parse()
-        .expect("GRPC_PORT must be a number");
-
-    let client = tonic_lnd::connect(address, port, cert_file, macaroon_file)
-        .await
-        .expect("failed to connect")
-        .lightning()
-        .clone();
-
-    // Make sure we can get info at startup
-    let _ =client
-            .clone().get_info(tonic_lnd::lnrpc::GetInfoRequest {})
-            .await
-            .expect("failed to get info");
-
-    let state = AppState::new(client);
-
-    let state = Arc::new(Mutex::new(state));
+    let state = setup().await;
 
     let app = Router::new()
         .route("/api/onchain", post(onchain_handler))
@@ -87,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("listening on {}", addr);
+    
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
         .await?;
@@ -94,56 +69,25 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[axum::debug_handler]
 async fn onchain_handler(
+    State(state): State<SharedState>,
     Json(payload): Json<OnchainRequest>,
-) -> (StatusCode, Json<OnchainResponse>) {
-    // let txid = pay_onchain(payload)?;
-    (StatusCode::OK, Json(OnchainResponse { txid: "heyo".to_string() }))
+) -> Result<Json<OnchainResponse>, AppError> {
+    let txid = pay_onchain(state.clone(), payload.clone()).await?;
+
+    Ok(Json(OnchainResponse { txid }))
 }
+
 
 #[axum::debug_handler]
 async fn lightning_handler(
     State(state): State<SharedState>,
     Json(payload): Json<LightningRequest>,
 ) -> Result<Json<LightningResponse>, AppError> {
-    let pop = pay_lightning(state.clone(), payload.clone()).await?;
+    let payment_hash = pay_lightning(state.clone(), payload.clone()).await?;
 
-    Ok(Json(LightningResponse {
-        pop,
-    }))
-
-    // (StatusCode::OK, Json(LightningResponse {
-    //     pop: "abc123".to_string(),
-    // }))
-}
-
-async fn pay_lightning(state: Arc<Mutex<AppState>>, payload: LightningRequest) -> anyhow::Result<String> {
-    let payment_hash = {
-        let mut lightning_client = state
-            .clone()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to get lock"))?
-            .lightning_client
-            .clone();
-
-
-        let response = lightning_client.send_payment_sync(tonic_lnd::lnrpc::SendRequest {
-            payment_request: payload.bolt11,
-            ..Default::default()
-        }).await?.into_inner();
-
-        // dbg!(response.clone());
-
-        if response.payment_error != "" {
-            return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
-        }
-
-        response.payment_hash
-    };
-
-    let hex_payment_hash = hex::encode(payment_hash.clone());
-   
-    Ok(hex_payment_hash)
+    Ok(Json(LightningResponse { payment_hash }))
 }
 
 // Make our own error that wraps `anyhow::Error`.
@@ -152,11 +96,7 @@ struct AppError(anyhow::Error);
 // Tell axum how to convert `AppError` into a response.
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("{}", self.0),
-        )
-            .into_response()
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", self.0)).into_response()
     }
 }
 

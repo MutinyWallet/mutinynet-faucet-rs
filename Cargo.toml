@@ -11,9 +11,9 @@ axum = { version = "0.6.16", features = ["macros"] }
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# tonic_lnd = "0.5.1"
-# tonic = { version = "0.8", features = ["transport", "tls"] }
-# tonic_lnd = { git = "https://github.com/fedimint/tonic_lnd", branch="lnd-client-features", features = ["lightningrpc", "routerrpc"] }
 tonic_lnd = { git = "https://github.com/okjodom/tonic_lnd", branch = "openssl-support" } 
 dotenv = "0.15.0"
 hex = "0.4.3"
+bitcoincore-rpc = "0.17.0"
+bitcoin = "0.30.0"
+lightning-invoice = "0.23.0"
