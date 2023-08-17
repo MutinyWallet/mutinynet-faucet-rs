@@ -18,9 +18,11 @@ use tower_http::cors::{Any, CorsLayer};
 mod lightning;
 mod onchain;
 mod setup;
+mod bolt11;
 
 use lightning::{pay_lightning, LightningRequest, LightningResponse};
 use onchain::{pay_onchain, OnchainRequest, OnchainResponse};
+use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
 use setup::setup;
 
 pub struct AppState {
@@ -54,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/onchain", post(onchain_handler))
         .route("/api/lightning", post(lightning_handler))
+        .route("/api/bolt11", post(bolt11_handler))
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -91,6 +94,17 @@ async fn lightning_handler(
 
     Ok(Json(LightningResponse { payment_hash }))
 }
+
+#[axum::debug_handler]
+async fn bolt11_handler(
+    State(state): State<SharedState>,
+    Json(payload): Json<Bolt11Request>,
+) -> Result<Json<Bolt11Response>, AppError> {
+    let bolt11 = request_bolt11(state.clone(), payload.clone()).await?;
+
+    Ok(Json(Bolt11Response{ bolt11 }))
+}
+
 
 // Make our own error that wraps `anyhow::Error`.
 struct AppError(anyhow::Error);
