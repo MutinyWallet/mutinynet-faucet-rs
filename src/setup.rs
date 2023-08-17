@@ -1,4 +1,5 @@
 use bitcoincore_rpc::{Auth, Client, RpcApi};
+use tonic_openssl_lnd::lnrpc;
 
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -32,7 +33,7 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
             .parse()
             .expect("GRPC_PORT must be a number");
 
-        let lightning_client = tonic_lnd::connect(address, port, cert_file, macaroon_file)
+        let lightning_client = tonic_openssl_lnd::connect(address, port, cert_file, macaroon_file)
             .await
             .expect("failed to connect")
             .lightning()
@@ -41,7 +42,7 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
         // Make sure we can get info at startup
         let _ = lightning_client
             .clone()
-            .get_info(tonic_lnd::lnrpc::GetInfoRequest {})
+            .get_info(lnrpc::GetInfoRequest {})
             .await
             .expect("failed to get info");
 

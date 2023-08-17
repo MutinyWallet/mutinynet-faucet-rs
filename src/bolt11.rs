@@ -1,14 +1,13 @@
-use lightning_invoice::Invoice;
+use tonic_openssl_lnd::lnrpc;
 use serde::{Deserialize, Serialize};
 
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
-use crate::{AppState, MAX_SEND_AMOUNT};
+use crate::AppState;
 
 #[derive(Clone, Deserialize)]
 pub struct Bolt11Request {
-    amount_sats: u64
+    amount_sats: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -22,21 +21,19 @@ pub async fn request_bolt11(
 ) -> anyhow::Result<String> {
     let bolt11 = {
         let mut lightning_client = state
-        .clone()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("failed to get lock"))?
-        .lightning_client
-        .clone();
+            .clone()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("failed to get lock"))?
+            .lightning_client
+            .clone();
 
-        let response = lightning_client.add_invoice(
-            tonic_lnd::lnrpc::Invoice {
+        let response = lightning_client
+            .add_invoice(lnrpc::Invoice {
                 value: payload.amount_sats as i64,
                 ..Default::default()
-            }
-
-        )
-        .await?
-        .into_inner();
+            })
+            .await?
+            .into_inner();
 
         response.payment_request
     };
