@@ -12,7 +12,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use tonic_lnd::LightningClient;
+use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{Any, CorsLayer};
 
 mod lightning;
@@ -27,13 +27,13 @@ use setup::setup;
 
 pub struct AppState {
     network: bitcoin::Network,
-    lightning_client: LightningClient,
+    lightning_client: LndLightningClient,
     bitcoin_client: Arc<Client>,
 }
 
 impl AppState {
     pub fn new(
-        lightning_client: LightningClient,
+        lightning_client: LndLightningClient,
         bitcoin_client: Client,
         network: bitcoin::Network,
     ) -> Self {
