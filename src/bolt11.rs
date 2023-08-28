@@ -7,7 +7,7 @@ use crate::AppState;
 
 #[derive(Clone, Deserialize)]
 pub struct Bolt11Request {
-    amount_sats: u64,
+    amount_sats: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -27,11 +27,16 @@ pub async fn request_bolt11(
             .lightning_client
             .clone();
 
+        let mut inv = lnrpc::Invoice {
+            ..Default::default()
+        };
+
+        if let Some(amt) = payload.amount_sats {
+            inv.value = amt as i64;
+        }
+
         let response = lightning_client
-            .add_invoice(lnrpc::Invoice {
-                value: payload.amount_sats as i64,
-                ..Default::default()
-            })
+            .add_invoice(inv)
             .await?
             .into_inner();
 
