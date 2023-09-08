@@ -16,11 +16,13 @@ use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{Any, CorsLayer};
 
 mod bolt11;
+mod channel;
 mod lightning;
 mod onchain;
 mod setup;
 
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
+use channel::{open_channel, ChannelRequest, ChannelResponse};
 use lightning::{pay_lightning, LightningRequest, LightningResponse};
 use onchain::{pay_onchain, OnchainRequest, OnchainResponse};
 use setup::setup;
@@ -57,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/onchain", post(onchain_handler))
         .route("/api/lightning", post(lightning_handler))
         .route("/api/bolt11", post(bolt11_handler))
+        .route("/api/channel", post(channel_handler))
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -103,6 +106,16 @@ async fn bolt11_handler(
     let bolt11 = request_bolt11(state.clone(), payload.clone()).await?;
 
     Ok(Json(Bolt11Response { bolt11 }))
+}
+
+#[axum::debug_handler]
+async fn channel_handler(
+    State(state): State<SharedState>,
+    Json(payload): Json<ChannelRequest>,
+) -> Result<Json<ChannelResponse>, AppError> {
+    let txid = open_channel(state.clone(), payload.clone()).await?;
+
+    Ok(Json(ChannelResponse { txid }))
 }
 
 // Make our own error that wraps `anyhow::Error`.
