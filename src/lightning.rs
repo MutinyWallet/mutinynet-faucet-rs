@@ -1,10 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+use lightning_invoice::Bolt11Invoice;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tonic_openssl_lnd::lnrpc;
-use lightning_invoice::Bolt11Invoice;
-
 
 use crate::{AppState, MAX_SEND_AMOUNT};
 
@@ -25,7 +24,7 @@ pub async fn pay_lightning(
     if let Ok(invoice) = Bolt11Invoice::from_str(&payload.bolt11) {
         if let Some(msat_amount) = invoice.amount_milli_satoshis() {
             if msat_amount / 1000 > MAX_SEND_AMOUNT {
-                anyhow::bail!("max amount is 1,000,000");
+                anyhow::bail!("max amount is 10,000,000");
             }
         } else {
             anyhow::bail!("bolt11 invoice should have an amount");
