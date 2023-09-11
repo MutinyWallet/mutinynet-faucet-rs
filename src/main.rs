@@ -1,6 +1,6 @@
 use axum::{
     extract::State,
-    http::{StatusCode, Method, self},
+    http::{self, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
@@ -15,14 +15,14 @@ use std::{
 use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{Any, CorsLayer};
 
+mod bolt11;
 mod lightning;
 mod onchain;
 mod setup;
-mod bolt11;
 
+use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
 use lightning::{pay_lightning, LightningRequest, LightningResponse};
 use onchain::{pay_onchain, OnchainRequest, OnchainResponse};
-use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
 use setup::setup;
 
 pub struct AppState {
@@ -47,7 +47,7 @@ impl AppState {
 
 type SharedState = Arc<Mutex<AppState>>;
 
-const MAX_SEND_AMOUNT: u64 = 1_000_000;
+const MAX_SEND_AMOUNT: u64 = 10_000_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -102,9 +102,8 @@ async fn bolt11_handler(
 ) -> Result<Json<Bolt11Response>, AppError> {
     let bolt11 = request_bolt11(state.clone(), payload.clone()).await?;
 
-    Ok(Json(Bolt11Response{ bolt11 }))
+    Ok(Json(Bolt11Response { bolt11 }))
 }
-
 
 // Make our own error that wraps `anyhow::Error`.
 struct AppError(anyhow::Error);
