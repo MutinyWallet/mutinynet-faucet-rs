@@ -24,7 +24,7 @@ pub async fn pay_onchain(
     payload: OnchainRequest,
 ) -> anyhow::Result<String> {
     if payload.sats > MAX_SEND_AMOUNT {
-        anyhow::bail!("max amount is 1,000,000");
+        anyhow::bail!("max amount is 10,000,000");
     }
 
     let txid = {

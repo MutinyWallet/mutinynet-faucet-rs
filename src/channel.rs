@@ -23,7 +23,7 @@ pub async fn open_channel(
     payload: ChannelRequest,
 ) -> anyhow::Result<String> {
     if payload.capacity > MAX_SEND_AMOUNT.try_into().unwrap() {
-        anyhow::bail!("max capacity is 1,000,000");
+        anyhow::bail!("max capacity is 10,000,000");
     }
     if payload.push_amount < 0 {
         anyhow::bail!("push_amount must be positive");
