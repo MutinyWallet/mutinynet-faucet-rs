@@ -10,7 +10,7 @@ pub struct ChannelRequest {
     capacity: i64,
     push_amount: i64,
     pubkey: String,
-    host: String,
+    host: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -32,10 +32,6 @@ pub async fn open_channel(
         anyhow::bail!("push_amount must be less than or equal to capacity");
     }
 
-    println!("pubkey: {:?}", payload.pubkey);
-    println!("capacity: {:?}", payload.capacity);
-    println!("push_amount: {:?}", payload.push_amount);
-
     let node_pubkey_result = hex::decode(payload.pubkey.clone());
     let node_pubkey = match node_pubkey_result {
         Ok(pubkey) => pubkey,
@@ -50,16 +46,18 @@ pub async fn open_channel(
             .lightning_client
             .clone();
 
-        lightning_client
-            .connect_peer(lnrpc::ConnectPeerRequest {
-                addr: Some(lnrpc::LightningAddress {
-                    pubkey: payload.pubkey.clone(),
-                    host: payload.host,
-                }),
-                ..Default::default()
-            })
-            .await
-            .ok();
+        if let Some(host) = payload.host {
+            lightning_client
+                .connect_peer(lnrpc::ConnectPeerRequest {
+                    addr: Some(lnrpc::LightningAddress {
+                        pubkey: payload.pubkey.clone(),
+                        host,
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .ok();
+        }
 
         lightning_client
             .open_channel_sync(lnrpc::OpenChannelRequest {
@@ -72,11 +70,9 @@ pub async fn open_channel(
             .into_inner()
     };
 
-    println!("channel_point: {:?}", channel_point);
-
-    let txid = match &channel_point.funding_txid {
-        Some(channel_point::FundingTxid::FundingTxidBytes(bytes)) => hex::encode(bytes.clone()),
-        Some(channel_point::FundingTxid::FundingTxidStr(string)) => string.clone(),
+    let txid = match channel_point.funding_txid {
+        Some(channel_point::FundingTxid::FundingTxidBytes(bytes)) => hex::encode(bytes),
+        Some(channel_point::FundingTxid::FundingTxidStr(string)) => string,
         None => anyhow::bail!("failed to open channel"),
     };
 
