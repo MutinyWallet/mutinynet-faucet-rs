@@ -1,5 +1,5 @@
-use tonic_openssl_lnd::lnrpc;
 use serde::{Deserialize, Serialize};
+use tonic_openssl_lnd::lnrpc;
 
 use std::sync::{Arc, Mutex};
 
@@ -35,10 +35,7 @@ pub async fn request_bolt11(
             inv.value = amt as i64;
         }
 
-        let response = lightning_client
-            .add_invoice(inv)
-            .await?
-            .into_inner();
+        let response = lightning_client.add_invoice(inv).await?.into_inner();
 
         response.payment_request
     };
