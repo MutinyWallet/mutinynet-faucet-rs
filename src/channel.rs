@@ -71,8 +71,15 @@ pub async fn open_channel(
     };
 
     let txid = match channel_point.funding_txid {
-        Some(channel_point::FundingTxid::FundingTxidBytes(bytes)) => hex::encode(bytes),
-        Some(channel_point::FundingTxid::FundingTxidStr(string)) => string,
+        Some(channel_point::FundingTxid::FundingTxidBytes(mut bytes)) => {
+            bytes.reverse();
+            hex::encode(bytes)
+        }
+        Some(channel_point::FundingTxid::FundingTxidStr(string)) => {
+            let mut bytes = hex::decode(string)?;
+            bytes.reverse();
+            hex::encode(bytes)
+        }
         None => anyhow::bail!("failed to open channel"),
     };
 

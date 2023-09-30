@@ -33,7 +33,7 @@ pub async fn pay_lightning(
         anyhow::bail!("invalid bolt11");
     }
 
-    let payment_hash = {
+    let payment_preimage = {
         let mut lightning_client = state
             .clone()
             .lock()
@@ -53,10 +53,8 @@ pub async fn pay_lightning(
             return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
         }
 
-        response.payment_hash
+        response.payment_preimage
     };
 
-    let hex_payment_hash = hex::encode(payment_hash);
-
-    Ok(hex_payment_hash)
+    Ok(hex::encode(payment_preimage))
 }
