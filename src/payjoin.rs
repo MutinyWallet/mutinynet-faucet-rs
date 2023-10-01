@@ -73,7 +73,7 @@ pub async fn request_bip21(state: Arc<Mutex<AppState>>, value: i64) -> anyhow::R
         bitcoin_client.import_address_script(
             &address.script_pubkey(),
             Some("payjoin"),
-            None,
+            Some(false),
             None,
         )?;
     }
