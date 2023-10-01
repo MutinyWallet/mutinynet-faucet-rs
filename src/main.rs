@@ -10,14 +10,14 @@ use axum::headers::HeaderMap;
 use axum::http::Uri;
 use axum::{
     extract::State,
-    http::{self, Method, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use bitcoincore_rpc::Client;
 use tonic_openssl_lnd::LndLightningClient;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowMethods, Any, CorsLayer};
 
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
 use channel::{open_channel, ChannelRequest, ChannelResponse};
@@ -75,8 +75,8 @@ async fn main() -> anyhow::Result<()> {
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
-                .allow_headers(vec![http::header::CONTENT_TYPE])
-                .allow_methods([Method::GET, Method::POST]),
+                .allow_headers(AllowHeaders::any())
+                .allow_methods(AllowMethods::any()),
         );
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3001));
