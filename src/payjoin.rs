@@ -139,7 +139,7 @@ pub async fn payjoin_request(
     // Receive Check 2: receiver can't sign for proposal inputs
     let proposal = proposal
         .check_inputs_not_owned(|input| {
-            if let Ok(address) = bitcoin::Address::from_script(input, network) {
+            if let Ok(address) = Address::from_script(input, network) {
                 Ok(bitcoin_client
                     .get_address_info(&address)
                     .map(|info| info.is_mine.unwrap_or(false))
@@ -164,7 +164,7 @@ pub async fn payjoin_request(
 
     let mut provisional_payjoin = payjoin
         .identify_receiver_outputs(|output_script| {
-            if let Ok(address) = bitcoin::Address::from_script(output_script, network) {
+            if let Ok(address) = Address::from_script(output_script, network) {
                 Ok(bitcoin_client
                     .get_address_info(&address)
                     .map(|info| info.is_mine.unwrap_or(false))
