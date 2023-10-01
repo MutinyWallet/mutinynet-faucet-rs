@@ -1,8 +1,11 @@
 use bitcoincore_rpc::{Auth, Client, RpcApi};
 use tonic_openssl_lnd::lnrpc;
 
+use bitcoin::Address;
 use std::env;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use tonic_openssl_lnd::lnrpc::AddressType;
 
 use crate::AppState;
 
@@ -26,7 +29,7 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
     println!("network: {:?}", network);
 
     // Setup lightning stuff
-    let (lightning_client, wallet_client) = {
+    let (lightning_client, wallet_client, address) = {
         let address = env::var("GRPC_HOST").expect("missing GRPC_HOST");
         let macaroon_file = env::var("ADMIN_MACAROON_PATH").expect("missing ADMIN_MACAROON_PATH");
         let cert_file = env::var("TLS_CERT_PATH").expect("missing TLS_CERT_PATH");
@@ -42,13 +45,19 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
         let lightning_client = lnd.lightning().clone();
 
         // Make sure we can get info at startup
-        let _ = lightning_client
+        let address = lightning_client
             .clone()
-            .get_info(lnrpc::GetInfoRequest {})
+            .new_address(lnrpc::NewAddressRequest {
+                r#type: AddressType::TaprootPubkey.into(),
+                ..Default::default()
+            })
             .await
-            .expect("failed to get info");
+            .expect("failed to get new address")
+            .into_inner()
+            .address;
+        let address = Address::from_str(&address).unwrap().assume_checked();
 
-        (lightning_client, lnd.wallet().clone())
+        (lightning_client, lnd.wallet().clone(), address)
     };
 
     // Setup bitcoin rpc stuff
@@ -71,6 +80,7 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
         wallet_client,
         bitcoin_client,
         network,
+        address,
     );
 
     Arc::new(Mutex::new(state))

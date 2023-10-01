@@ -15,6 +15,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use bitcoin::Address;
 use bitcoincore_rpc::Client;
 use tonic_openssl_lnd::{LndLightningClient, LndWalletClient};
 use tower_http::cors::{AllowHeaders, AllowMethods, Any, CorsLayer};
@@ -38,6 +39,7 @@ pub struct AppState {
     lightning_client: LndLightningClient,
     wallet_client: LndWalletClient,
     bitcoin_client: Arc<Client>,
+    address: Address,
 }
 
 impl AppState {
@@ -47,6 +49,7 @@ impl AppState {
         wallet_client: LndWalletClient,
         bitcoin_client: Client,
         network: bitcoin::Network,
+        address: Address,
     ) -> Self {
         AppState {
             host,
@@ -54,6 +57,7 @@ impl AppState {
             lightning_client,
             wallet_client,
             bitcoin_client: Arc::new(bitcoin_client),
+            address,
         }
     }
 }

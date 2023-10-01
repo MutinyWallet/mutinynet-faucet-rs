@@ -17,9 +17,6 @@ use tonic_openssl_lnd::walletrpc::SignPsbtRequest;
 
 use crate::AppState;
 
-// Fixed address for lnd
-const ADDRESS: &str = "tb1pmkklqa2xu9xsmkq0yewn96su0vtguy8yfn9qqly2k88vlly8fz2ql0xxmk";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bip21Request {
     pub amount: i64,
@@ -50,7 +47,11 @@ pub async fn request_bip21(state: Arc<Mutex<AppState>>, value: i64) -> anyhow::R
             .payment_request
     };
 
-    let address = Address::from_str(ADDRESS)?.assume_checked();
+    let address = state
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("failed to get lock"))?
+        .address
+        .clone();
 
     let amount = Amount::from_sat(value as u64);
 
@@ -98,13 +99,11 @@ pub async fn payjoin_request(
         .lightning_client
         .clone();
 
-    // The network is used for checks later
-    let network = state
+    let fixed_address = state
         .lock()
         .map_err(|_| anyhow::anyhow!("failed to get lock"))?
-        .network;
-
-    let fixed_address = Address::from_str(ADDRESS)?.assume_checked();
+        .address
+        .clone();
 
     // Receive Check 1: Can Broadcast
     let proposal = proposal
@@ -120,13 +119,7 @@ pub async fn payjoin_request(
 
     // Receive Check 2: receiver can't sign for proposal inputs
     let proposal = proposal
-        .check_inputs_not_owned(|input| {
-            if let Ok(address) = Address::from_script(input, network) {
-                Ok(fixed_address == address)
-            } else {
-                Ok(false)
-            }
-        })
+        .check_inputs_not_owned(|input| Ok(input == &fixed_address.script_pubkey()))
         .map_err(|_| anyhow!("Failed to validate inputs"))?;
     log::trace!("check2");
     // Receive Check 3: receiver can't sign for proposal inputs
@@ -143,11 +136,7 @@ pub async fn payjoin_request(
 
     let mut provisional_payjoin = payjoin
         .identify_receiver_outputs(|output_script| {
-            if let Ok(address) = Address::from_script(output_script, network) {
-                Ok(fixed_address == address)
-            } else {
-                Ok(false)
-            }
+            Ok(output_script == &fixed_address.script_pubkey())
         })
         .map_err(|_| anyhow!("Failed to identify receiver outputs"))?;
 
