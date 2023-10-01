@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context};
 use axum::headers::HeaderMap;
 use bitcoin::psbt::Psbt;
 use bitcoin::Amount;
+use bitcoincore_rpc::json::AddressType;
 use bitcoincore_rpc::RpcApi;
 use payjoin::receive::ProvisionalProposal;
 use serde::{Deserialize, Serialize};
@@ -44,25 +45,13 @@ pub async fn request_bip21(state: Arc<Mutex<AppState>>, value: i64) -> anyhow::R
     };
 
     let address = {
-        let mut lightning_client = state
-            .try_lock()
+        state
+            .lock()
             .map_err(|_| anyhow::anyhow!("failed to get lock"))?
-            .lightning_client
-            .clone();
-
-        let req = lnrpc::NewAddressRequest {
-            r#type: lnrpc::AddressType::TaprootPubkey.into(),
-            ..Default::default()
-        };
-
-        lightning_client
-            .new_address(req)
-            .await?
-            .into_inner()
-            .address
+            .bitcoin_client
+            .get_new_address(Some("payjoin"), Some(AddressType::Bech32m))?
+            .assume_checked()
     };
-    let address = payjoin::bitcoin::address::Address::from_str(&address)?.assume_checked();
-
     let amount = Amount::from_sat(value as u64);
 
     let host = state
