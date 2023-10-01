@@ -133,18 +133,18 @@ pub async fn payjoin_request(
                 Ok(false)
             }
         })
-        .map_err(|_| anyhow!("Failed to sign inputs"))?;
+        .map_err(|_| anyhow!("Failed to validate inputs"))?;
     log::trace!("check2");
     // Receive Check 3: receiver can't sign for proposal inputs
     let proposal = proposal
         .check_no_mixed_input_scripts()
-        .map_err(|_| anyhow!("Failed to sign inputs"))?;
+        .map_err(|_| anyhow!("Failed to validate input scripts"))?;
     log::trace!("check3");
 
     // Receive Check 4: have we seen this input before? More of a check for non-interactive i.e. payment processor receivers.
     let payjoin = proposal
         .check_no_inputs_seen_before(|_| Ok(false))
-        .map_err(|_| anyhow!("Failed to sign inputs"))?;
+        .map_err(|_| anyhow!("Failed to check no inputs seen"))?;
     log::trace!("check4");
 
     let mut provisional_payjoin = payjoin
@@ -158,11 +158,11 @@ pub async fn payjoin_request(
                 Ok(false)
             }
         })
-        .map_err(|_| anyhow!("Failed to sign inputs"))?;
+        .map_err(|_| anyhow!("Failed to identify receiver outputs"))?;
 
     // Select receiver payjoin inputs.
     _ = try_contributing_inputs(&mut provisional_payjoin, &bitcoin_client)
-        .map_err(|e| log::warn!("Failed to contribute inputs: {}", e));
+        .map_err(|e| log::warn!("Failed to contribute inputs: {e}"));
 
     let receiver_substitute_address = bitcoin_client.get_new_address(None, None)?.assume_checked();
     provisional_payjoin.substitute_output_address(receiver_substitute_address);
