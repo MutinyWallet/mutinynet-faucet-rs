@@ -12,6 +12,8 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
     dotenv::from_filename(".env").ok();
     dotenv::dotenv().ok();
 
+    let host = env::var("HOST").expect("missing HOST");
+
     let network = env::var("NETWORK").expect("missing NETWORK");
 
     let network = match network {
@@ -63,7 +65,7 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
         rpc
     };
 
-    let state = AppState::new(lightning_client, bitcoin_client, network);
+    let state = AppState::new(host, lightning_client, bitcoin_client, network);
 
     Arc::new(Mutex::new(state))
 }

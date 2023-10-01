@@ -1,25 +1,23 @@
-use axum::{
-    extract::State,
-    http::{self, Method, StatusCode},
-    response::{IntoResponse, Response},
-    routing::post,
-    Json, Router,
-};
-
-use bitcoincore_rpc::Client;
-
+use std::collections::HashMap;
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
+
+use axum::body::Bytes;
+use axum::extract::Query;
+use axum::headers::HeaderMap;
+use axum::http::Uri;
+use axum::{
+    extract::State,
+    http::{self, Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use bitcoincore_rpc::Client;
 use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{Any, CorsLayer};
-
-mod bolt11;
-mod channel;
-mod lightning;
-mod onchain;
-mod setup;
 
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
 use channel::{open_channel, ChannelRequest, ChannelResponse};
@@ -27,7 +25,15 @@ use lightning::{pay_lightning, LightningRequest, LightningResponse};
 use onchain::{pay_onchain, OnchainRequest, OnchainResponse};
 use setup::setup;
 
+mod bolt11;
+mod channel;
+mod lightning;
+mod onchain;
+mod payjoin;
+mod setup;
+
 pub struct AppState {
+    pub host: String,
     network: bitcoin::Network,
     lightning_client: LndLightningClient,
     bitcoin_client: Arc<Client>,
@@ -35,11 +41,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(
+        host: String,
         lightning_client: LndLightningClient,
         bitcoin_client: Client,
         network: bitcoin::Network,
     ) -> Self {
         AppState {
+            host,
             network,
             lightning_client,
             bitcoin_client: Arc::new(bitcoin_client),
@@ -59,7 +67,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/onchain", post(onchain_handler))
         .route("/api/lightning", post(lightning_handler))
         .route("/api/bolt11", post(bolt11_handler))
+        .route("/api/bip21", get(bip21_handler))
+        .route("/api/payjoin", post(payjoin_handler))
         .route("/api/channel", post(channel_handler))
+        .fallback(fallback)
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -118,6 +129,34 @@ async fn channel_handler(
     Ok(Json(ChannelResponse { txid }))
 }
 
+#[axum::debug_handler]
+async fn bip21_handler(
+    State(state): State<SharedState>,
+    Query(request): Query<payjoin::Bip21Request>,
+) -> Result<Json<payjoin::Bip21Response>, AppError> {
+    let bip21 = payjoin::request_bip21(state.clone(), request.amount).await?;
+
+    Ok(Json(payjoin::Bip21Response { bip21 }))
+}
+
+#[axum::debug_handler]
+async fn payjoin_handler(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    params: Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<String, AppError> {
+    let params_str = params
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<String>>()
+        .join("&");
+    let base64 =
+        payjoin::payjoin_request(state.clone(), headers, body.to_vec(), params_str).await?;
+
+    Ok(base64)
+}
+
 // Make our own error that wraps `anyhow::Error`.
 struct AppError(anyhow::Error);
 
@@ -141,4 +180,8 @@ where
     fn from(err: E) -> Self {
         Self(err.into())
     }
+}
+
+async fn fallback(uri: Uri) -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, format!("No route for {}", uri))
 }
