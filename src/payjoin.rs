@@ -2,7 +2,6 @@ use anyhow::{anyhow, Context};
 use axum::headers::HeaderMap;
 use bitcoin::psbt::Psbt;
 use bitcoin::Amount;
-use bitcoincore_rpc::json::AddressType;
 use bitcoincore_rpc::RpcApi;
 use payjoin::receive::ProvisionalProposal;
 use serde::{Deserialize, Serialize};
@@ -49,7 +48,7 @@ pub async fn request_bip21(state: Arc<Mutex<AppState>>, value: i64) -> anyhow::R
             .lock()
             .map_err(|_| anyhow::anyhow!("failed to get lock"))?
             .bitcoin_client
-            .get_new_address(Some("payjoin"), Some(AddressType::Bech32m))?
+            .get_new_address(Some("payjoin"), None)?
             .assume_checked()
     };
     let amount = Amount::from_sat(value as u64);
