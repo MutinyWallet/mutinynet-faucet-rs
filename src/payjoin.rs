@@ -138,7 +138,10 @@ pub async fn payjoin_request(
         .identify_receiver_outputs(|output_script| {
             Ok(output_script == &fixed_address.script_pubkey())
         })
-        .map_err(|_| anyhow!("Failed to identify receiver outputs"))?;
+        .map_err(|e| {
+            eprintln!("Failed to identify receiver outputs: {e}");
+            anyhow!("Failed to identify receiver outputs: {e}")
+        })?;
 
     // Select receiver payjoin inputs.
     _ = try_contributing_inputs(&mut provisional_payjoin, &bitcoin_client)
