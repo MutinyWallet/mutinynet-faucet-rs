@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context};
 use axum::headers::HeaderMap;
 use bitcoin::psbt::Psbt;
-use bitcoin::Amount;
+use bitcoin::{Address, Amount};
 use bitcoincore_rpc::RpcApi;
 use payjoin::receive::ProvisionalProposal;
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,7 @@ use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tonic_openssl_lnd::lnrpc;
+use tonic_openssl_lnd::lnrpc::AddressType;
 
 use crate::AppState;
 
@@ -44,13 +45,39 @@ pub async fn request_bip21(state: Arc<Mutex<AppState>>, value: i64) -> anyhow::R
     };
 
     let address = {
-        state
+        let mut lightning_client = state
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("failed to get lock"))?
+            .lightning_client
+            .clone();
+
+        lightning_client
+            .new_address(lnrpc::NewAddressRequest {
+                r#type: AddressType::TaprootPubkey.into(),
+                ..Default::default()
+            })
+            .await?
+            .into_inner()
+            .address
+    };
+    let address = Address::from_str(&address)?.assume_checked();
+
+    // watch address
+    {
+        let bitcoin_client = state
             .lock()
             .map_err(|_| anyhow::anyhow!("failed to get lock"))?
             .bitcoin_client
-            .get_new_address(Some("payjoin"), None)?
-            .assume_checked()
-    };
+            .clone();
+
+        bitcoin_client.import_address_script(
+            &address.script_pubkey(),
+            Some("payjoin"),
+            None,
+            None,
+        )?;
+    }
+
     let amount = Amount::from_sat(value as u64);
 
     let host = state
