@@ -189,11 +189,15 @@ pub async fn payjoin_request(
             },
             Some(bitcoin::FeeRate::MIN),
         )
-        .map_err(|e| anyhow!("Failed to finalize proposal: {}", e))?;
+        .map_err(|e| anyhow!("Failed to finalize proposal: {e}"))?;
     let payjoin_proposal_psbt = payjoin_proposal.psbt();
-    log::debug!("Receiver's Payjoin proposal PSBT Response: {payjoin_proposal_psbt:#?}");
 
-    let payload = payjoin::base64::encode(payjoin_proposal_psbt.serialize());
+    let finalized = bitcoin_client.finalize_psbt(&payjoin_proposal_psbt.to_string(), None)?;
+    let psbt = Psbt::from_str(&finalized.psbt.unwrap())?;
+
+    log::debug!("Receiver's Payjoin proposal PSBT Response: {psbt:#?}");
+
+    let payload = payjoin::base64::encode(psbt.serialize());
     log::info!("successful response");
     Ok(payload)
 }
