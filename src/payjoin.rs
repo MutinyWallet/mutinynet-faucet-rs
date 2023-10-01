@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context};
 use axum::headers::HeaderMap;
+use bitcoin::hashes::Hash;
 use bitcoin::psbt::Psbt;
-use bitcoin::{Address, Amount};
+use bitcoin::{Address, Amount, ScriptBuf, Txid};
 use bitcoincore_rpc::RpcApi;
 use payjoin::receive::ProvisionalProposal;
 use serde::{Deserialize, Serialize};
@@ -11,9 +12,10 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 use tokio::task::block_in_place;
-use tonic_openssl_lnd::lnrpc;
 use tonic_openssl_lnd::lnrpc::AddressType;
+use tonic_openssl_lnd::walletrpc::fund_psbt_request::{Fees, Template};
 use tonic_openssl_lnd::walletrpc::SignPsbtRequest;
+use tonic_openssl_lnd::{lnrpc, walletrpc, LndWalletClient};
 
 use crate::AppState;
 
@@ -99,6 +101,12 @@ pub async fn payjoin_request(
         .lightning_client
         .clone();
 
+    let mut wallet_client = state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("failed to get lock"))?
+        .wallet_client
+        .clone();
+
     let fixed_address = state
         .lock()
         .map_err(|_| anyhow::anyhow!("failed to get lock"))?
@@ -144,7 +152,8 @@ pub async fn payjoin_request(
         })?;
 
     // Select receiver payjoin inputs.
-    _ = try_contributing_inputs(&mut provisional_payjoin, &bitcoin_client)
+    _ = try_contributing_inputs(&mut provisional_payjoin, &mut wallet_client)
+        .await
         .map_err(|e| log::warn!("Failed to contribute inputs: {e}"));
 
     let receiver_substitute_address = {
@@ -163,9 +172,6 @@ pub async fn payjoin_request(
     let payjoin_proposal = provisional_payjoin
         .finalize_proposal(
             |psbt: &Psbt| {
-                let request = SignPsbtRequest {
-                    funded_psbt: psbt.serialize(),
-                };
                 let mut wallet_client = state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("failed to get lock"))
@@ -175,6 +181,18 @@ pub async fn payjoin_request(
 
                 block_in_place(move || {
                     Handle::current().block_on(async move {
+                        let temp = Template::Psbt(psbt.serialize());
+                        let fees = Fees::TargetConf(6);
+                        let request = walletrpc::FundPsbtRequest {
+                            template: Some(temp),
+                            fees: Some(fees),
+                            ..Default::default()
+                        };
+                        let funded = wallet_client.fund_psbt(request).await.unwrap().into_inner();
+
+                        let request = SignPsbtRequest {
+                            funded_psbt: funded.funded_psbt,
+                        };
                         wallet_client
                             .sign_psbt(request)
                             .await
@@ -187,7 +205,7 @@ pub async fn payjoin_request(
                     })
                 })
             },
-            Some(bitcoin::FeeRate::MIN),
+            Some(bitcoin::FeeRate::BROADCAST_MIN),
         )
         .map_err(|e| anyhow!("Failed to finalize proposal: {e}"))?;
     let payjoin_proposal_psbt = payjoin_proposal.psbt();
@@ -202,23 +220,30 @@ pub async fn payjoin_request(
     Ok(payload)
 }
 
-fn try_contributing_inputs(
+async fn try_contributing_inputs(
     payjoin: &mut ProvisionalProposal,
-    bitcoind: &bitcoincore_rpc::Client,
+    lnd: &mut LndWalletClient,
 ) -> anyhow::Result<()> {
     use bitcoin::OutPoint;
 
-    let available_inputs = bitcoind
-        .list_unspent(None, None, None, None, None)
-        .context("Failed to list unspent from bitcoind")?;
+    let available_inputs = lnd
+        .list_unspent(walletrpc::ListUnspentRequest {
+            min_confs: 0,
+            max_confs: 9999999,
+            ..Default::default()
+        })
+        .await?
+        .into_inner()
+        .utxos;
+
     let candidate_inputs: HashMap<Amount, OutPoint> = available_inputs
         .iter()
         .map(|i| {
             (
-                i.amount,
+                Amount::from_sat(i.amount_sat as u64),
                 OutPoint {
-                    txid: i.txid,
-                    vout: i.vout,
+                    txid: Txid::from_slice(&i.outpoint.as_ref().unwrap().txid_bytes).unwrap(),
+                    vout: i.outpoint.as_ref().unwrap().output_index,
                 },
             )
         })
@@ -229,19 +254,34 @@ fn try_contributing_inputs(
         .map_err(|_| anyhow!("Failed to preserve privacy"))?;
     let selected_utxo = available_inputs
         .iter()
-        .find(|i| i.txid == selected_outpoint.txid && i.vout == selected_outpoint.vout)
-        .context("This shouldn't happen. Failed to retrieve the privacy preserving utxo from those we provided to the seclector.")?;
+        .find(|i| i.outpoint.as_ref().unwrap().txid_bytes == selected_outpoint.txid.to_byte_array().to_vec() && i.outpoint.as_ref().unwrap().output_index == selected_outpoint.vout)
+        .context("This shouldn't happen. Failed to retrieve the privacy preserving utxo from those we provided to the selector.")?;
     log::debug!("selected utxo: {:#?}", selected_utxo);
 
-    //  calculate receiver payjoin outputs given receiver payjoin inputs and original_psbt,
+    // calculate receiver payjoin outputs given receiver payjoin inputs and original_psbt,
     let txo_to_contribute = bitcoin::TxOut {
-        value: selected_utxo.amount.to_sat(),
-        script_pubkey: selected_utxo.script_pub_key.clone(),
+        value: selected_utxo.amount_sat as u64,
+        script_pubkey: ScriptBuf::from_hex(&selected_utxo.pk_script).unwrap(),
     };
     let outpoint_to_contribute = OutPoint {
-        txid: selected_utxo.txid,
-        vout: selected_utxo.vout,
+        txid: Txid::from_slice(&selected_utxo.outpoint.as_ref().unwrap().txid_bytes).unwrap(),
+        vout: selected_utxo.outpoint.as_ref().unwrap().output_index,
     };
+
+    // Reserve the selected input for the payjoin.
+    // We need this to be able to sign the payjoin.
+    let outpoint = lnrpc::OutPoint {
+        txid_bytes: outpoint_to_contribute.txid.to_byte_array().to_vec(),
+        output_index: outpoint_to_contribute.vout,
+        ..Default::default()
+    };
+    let req = walletrpc::LeaseOutputRequest {
+        id: b"payjoin".to_vec(),
+        outpoint: Some(outpoint),
+        expiration_seconds: 30,
+    };
+    lnd.lease_output(req).await?;
+
     payjoin.contribute_witness_input(txo_to_contribute, outpoint_to_contribute);
     Ok(())
 }
