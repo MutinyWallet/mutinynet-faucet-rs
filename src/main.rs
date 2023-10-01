@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use bitcoincore_rpc::Client;
-use tonic_openssl_lnd::LndLightningClient;
+use tonic_openssl_lnd::{LndLightningClient, LndWalletClient};
 use tower_http::cors::{AllowHeaders, AllowMethods, Any, CorsLayer};
 
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
@@ -36,6 +36,7 @@ pub struct AppState {
     pub host: String,
     network: bitcoin::Network,
     lightning_client: LndLightningClient,
+    wallet_client: LndWalletClient,
     bitcoin_client: Arc<Client>,
 }
 
@@ -43,6 +44,7 @@ impl AppState {
     pub fn new(
         host: String,
         lightning_client: LndLightningClient,
+        wallet_client: LndWalletClient,
         bitcoin_client: Client,
         network: bitcoin::Network,
     ) -> Self {
@@ -50,6 +52,7 @@ impl AppState {
             host,
             network,
             lightning_client,
+            wallet_client,
             bitcoin_client: Arc::new(bitcoin_client),
         }
     }

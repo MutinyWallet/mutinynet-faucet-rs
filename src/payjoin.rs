@@ -9,10 +9,16 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use tokio::runtime::Handle;
+use tokio::task::block_in_place;
 use tonic_openssl_lnd::lnrpc;
 use tonic_openssl_lnd::lnrpc::AddressType;
+use tonic_openssl_lnd::walletrpc::SignPsbtRequest;
 
 use crate::AppState;
+
+// Fixed address for lnd
+const ADDRESS: &str = "tb1pmkklqa2xu9xsmkq0yewn96su0vtguy8yfn9qqly2k88vlly8fz2ql0xxmk";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bip21Request {
@@ -44,39 +50,7 @@ pub async fn request_bip21(state: Arc<Mutex<AppState>>, value: i64) -> anyhow::R
             .payment_request
     };
 
-    let address = {
-        let mut lightning_client = state
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("failed to get lock"))?
-            .lightning_client
-            .clone();
-
-        lightning_client
-            .new_address(lnrpc::NewAddressRequest {
-                r#type: AddressType::TaprootPubkey.into(),
-                ..Default::default()
-            })
-            .await?
-            .into_inner()
-            .address
-    };
-    let address = Address::from_str(&address)?.assume_checked();
-
-    // watch address
-    {
-        let bitcoin_client = state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to get lock"))?
-            .bitcoin_client
-            .clone();
-
-        bitcoin_client.import_address_script(
-            &address.script_pubkey(),
-            Some("payjoin"),
-            Some(false),
-            None,
-        )?;
-    }
+    let address = Address::from_str(ADDRESS)?.assume_checked();
 
     let amount = Amount::from_sat(value as u64);
 
@@ -118,11 +92,19 @@ pub async fn payjoin_request(
         .bitcoin_client
         .clone();
 
+    let mut lightning_client = state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("failed to get lock"))?
+        .lightning_client
+        .clone();
+
     // The network is used for checks later
     let network = state
         .lock()
         .map_err(|_| anyhow::anyhow!("failed to get lock"))?
         .network;
+
+    let fixed_address = Address::from_str(ADDRESS)?.assume_checked();
 
     // Receive Check 1: Can Broadcast
     let proposal = proposal
@@ -140,10 +122,7 @@ pub async fn payjoin_request(
     let proposal = proposal
         .check_inputs_not_owned(|input| {
             if let Ok(address) = Address::from_script(input, network) {
-                Ok(bitcoin_client
-                    .get_address_info(&address)
-                    .map(|info| info.is_mine.unwrap_or(false))
-                    .unwrap())
+                Ok(fixed_address == address)
             } else {
                 Ok(false)
             }
@@ -165,10 +144,7 @@ pub async fn payjoin_request(
     let mut provisional_payjoin = payjoin
         .identify_receiver_outputs(|output_script| {
             if let Ok(address) = Address::from_script(output_script, network) {
-                Ok(bitcoin_client
-                    .get_address_info(&address)
-                    .map(|info| info.is_mine.unwrap_or(false))
-                    .unwrap())
+                Ok(fixed_address == address)
             } else {
                 Ok(false)
             }
@@ -179,23 +155,45 @@ pub async fn payjoin_request(
     _ = try_contributing_inputs(&mut provisional_payjoin, &bitcoin_client)
         .map_err(|e| log::warn!("Failed to contribute inputs: {e}"));
 
-    let receiver_substitute_address = bitcoin_client.get_new_address(None, None)?.assume_checked();
+    let receiver_substitute_address = {
+        let address = lightning_client
+            .new_address(lnrpc::NewAddressRequest {
+                r#type: AddressType::TaprootPubkey.into(),
+                ..Default::default()
+            })
+            .await?
+            .into_inner()
+            .address;
+        Address::from_str(&address)?.assume_checked()
+    };
     provisional_payjoin.substitute_output_address(receiver_substitute_address);
 
     let payjoin_proposal = provisional_payjoin
         .finalize_proposal(
             |psbt: &Psbt| {
-                bitcoin_client
-                    .wallet_process_psbt(
-                        &payjoin::base64::encode(psbt.serialize()),
-                        None,
-                        None,
-                        Some(false),
-                    )
-                    .map(|res| {
-                        Psbt::from_str(&res.psbt).map_err(|e| payjoin::Error::Server(e.into()))
-                    })
+                let request = SignPsbtRequest {
+                    funded_psbt: psbt.serialize(),
+                };
+                let mut wallet_client = state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("failed to get lock"))
                     .map_err(|e| payjoin::Error::Server(e.into()))?
+                    .wallet_client
+                    .clone();
+
+                block_in_place(move || {
+                    Handle::current().block_on(async move {
+                        wallet_client
+                            .sign_psbt(request)
+                            .await
+                            .map(|res| {
+                                let res = res.into_inner();
+                                Psbt::deserialize(&res.signed_psbt)
+                                    .map_err(|e| payjoin::Error::Server(e.into()))
+                            })
+                            .map_err(|e| payjoin::Error::Server(e.into()))?
+                    })
+                })
             },
             Some(bitcoin::FeeRate::MIN),
         )

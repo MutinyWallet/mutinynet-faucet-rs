@@ -26,7 +26,7 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
     println!("network: {:?}", network);
 
     // Setup lightning stuff
-    let lightning_client = {
+    let (lightning_client, wallet_client) = {
         let address = env::var("GRPC_HOST").expect("missing GRPC_HOST");
         let macaroon_file = env::var("ADMIN_MACAROON_PATH").expect("missing ADMIN_MACAROON_PATH");
         let cert_file = env::var("TLS_CERT_PATH").expect("missing TLS_CERT_PATH");
@@ -35,11 +35,11 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
             .parse()
             .expect("GRPC_PORT must be a number");
 
-        let lightning_client = tonic_openssl_lnd::connect(address, port, cert_file, macaroon_file)
+        let mut lnd = tonic_openssl_lnd::connect(address, port, cert_file, macaroon_file)
             .await
-            .expect("failed to connect")
-            .lightning()
-            .clone();
+            .expect("failed to connect");
+
+        let lightning_client = lnd.lightning().clone();
 
         // Make sure we can get info at startup
         let _ = lightning_client
@@ -48,7 +48,7 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
             .await
             .expect("failed to get info");
 
-        lightning_client
+        (lightning_client, lnd.wallet().clone())
     };
 
     // Setup bitcoin rpc stuff
@@ -65,7 +65,13 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
         rpc
     };
 
-    let state = AppState::new(host, lightning_client, bitcoin_client, network);
+    let state = AppState::new(
+        host,
+        lightning_client,
+        wallet_client,
+        bitcoin_client,
+        network,
+    );
 
     Arc::new(Mutex::new(state))
 }
