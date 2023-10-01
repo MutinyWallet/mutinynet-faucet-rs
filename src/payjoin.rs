@@ -72,7 +72,7 @@ pub async fn request_bip21(state: Arc<Mutex<AppState>>, value: i64) -> anyhow::R
         .clone();
 
     Ok(format!(
-        "{}?amount={}&invoice={bolt11}&pj={host}/v1/payjoin",
+        "{}?amount={}&invoice={bolt11}&pj={host}/api/payjoin",
         address.to_qr_uri(),
         amount.to_btc()
     ))
