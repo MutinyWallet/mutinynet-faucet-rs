@@ -47,16 +47,26 @@ pub async fn open_channel(
             .clone();
 
         if let Some(host) = payload.host {
-            lightning_client
-                .connect_peer(lnrpc::ConnectPeerRequest {
-                    addr: Some(lnrpc::LightningAddress {
-                        pubkey: payload.pubkey.clone(),
-                        host,
-                    }),
-                    ..Default::default()
-                })
-                .await
-                .ok();
+            let connected = lightning_client
+                .list_peers(lnrpc::ListPeersRequest::default())
+                .await?
+                .into_inner()
+                .peers
+                .into_iter()
+                .any(|peer| peer.pub_key == payload.pubkey);
+
+            if !connected {
+                lightning_client
+                    .connect_peer(lnrpc::ConnectPeerRequest {
+                        addr: Some(lnrpc::LightningAddress {
+                            pubkey: payload.pubkey.clone(),
+                            host,
+                        }),
+                        ..Default::default()
+                    })
+                    .await
+                    .ok();
+            }
         }
 
         lightning_client
