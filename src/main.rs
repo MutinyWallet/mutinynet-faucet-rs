@@ -17,6 +17,8 @@ use axum::{
 };
 use bitcoin::Address;
 use bitcoincore_rpc::Client;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::oneshot;
 use tonic_openssl_lnd::{LndLightningClient, LndWalletClient};
 use tower_http::cors::{AllowHeaders, AllowMethods, Any, CorsLayer};
 
@@ -87,12 +89,47 @@ async fn main() -> anyhow::Result<()> {
                 .allow_methods(AllowMethods::any()),
         );
 
+    // Set up a oneshot channel to handle shutdown signal
+    let (tx, rx) = oneshot::channel();
+
+    // Spawn a task to listen for shutdown signals
+    tokio::spawn(async move {
+        let mut term_signal = signal(SignalKind::terminate())
+            .map_err(|e| eprintln!("failed to install TERM signal handler: {e}"))
+            .unwrap();
+        let mut int_signal = signal(SignalKind::interrupt())
+            .map_err(|e| {
+                eprintln!("failed to install INT signal handler: {e}");
+            })
+            .unwrap();
+
+        tokio::select! {
+            _ = term_signal.recv() => {
+                println!("Received SIGTERM");
+            },
+            _ = int_signal.recv() => {
+                println!("Received SIGINT");
+            },
+        }
+
+        let _ = tx.send(());
+    });
+
     let addr = SocketAddr::from(([0, 0, 0, 0], 3001));
     println!("listening on {}", addr);
 
-    axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await?;
+    let server = axum::Server::bind(&addr).serve(app.into_make_service());
+
+    let graceful = server.with_graceful_shutdown(async {
+        let _ = rx.await;
+    });
+
+    // Await the server to receive the shutdown signal
+    if let Err(e) = graceful.await {
+        eprintln!("shutdown error: {e}");
+    }
+
+    println!("Graceful shutdown complete");
 
     Ok(())
 }
