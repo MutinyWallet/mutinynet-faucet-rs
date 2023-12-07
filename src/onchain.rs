@@ -1,6 +1,6 @@
 use bitcoin::{Address, Amount};
+use bitcoin_waila::PaymentParams;
 use bitcoincore_rpc::RpcApi;
-
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -33,7 +33,13 @@ pub async fn pay_onchain(
             .map_err(|_| anyhow::anyhow!("failed to get lock"))?
             .network;
 
-        let address = Address::from_str(&payload.address).map_err(|e| anyhow::anyhow!(e))?;
+        // need to convert from different rust-bitcoin versions
+        let params = PaymentParams::from_str(&payload.address)
+            .map_err(|_| anyhow::anyhow!("invalid address"))?;
+        let address_str = params.address().ok_or(anyhow::anyhow!("invalid address"))?;
+
+        let address =
+            Address::from_str(&address_str.to_string()).map_err(|e| anyhow::anyhow!(e))?;
 
         let address = if address.is_valid_for_network(network) {
             address
