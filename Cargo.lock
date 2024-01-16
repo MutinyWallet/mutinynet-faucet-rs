@@ -261,7 +261,6 @@ version = "0.30.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1945a5048598e4189e239d3f809b19bdad4845c4b2ba400d304d2dcf26d2c462"
 dependencies = [
- "base64 0.13.1",
  "bech32",
  "bitcoin-private",
  "bitcoin_hashes 0.12.0",
@@ -1201,7 +1200,6 @@ dependencies = [
  "lightning-invoice",
  "lnurl-rs",
  "log",
- "payjoin",
  "pretty_env_logger 0.5.0",
  "serde",
  "serde_json",
@@ -1355,19 +1353,6 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-targets 0.48.5",
-]
-
-[[package]]
-name = "payjoin"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fac532e6caa3a192dd6017a88446c2a1014d31b66cc68f04c584a846a4cb0373"
-dependencies = [
- "bip21",
- "bitcoin",
- "log",
- "rand",
- "url",
 ]
 
 [[package]]
