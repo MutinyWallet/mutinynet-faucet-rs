@@ -17,6 +17,10 @@ use axum::{
 };
 use bitcoin::Address;
 use bitcoincore_rpc::Client;
+use lnurl::withdraw::WithdrawalResponse;
+use lnurl::Tag;
+use serde::Deserialize;
+use serde_json::{json, Value};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::oneshot;
 use tonic_openssl_lnd::{LndLightningClient, LndWalletClient};
@@ -76,6 +80,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/onchain", post(onchain_handler))
         .route("/api/lightning", post(lightning_handler))
+        .route("/api/lnurlw", get(lnurlw_handler))
+        .route("/api/lnurlw/callback", get(lnurlw_callback_handler))
         .route("/api/bolt11", post(bolt11_handler))
         .route("/api/bip21", get(bip21_handler))
         .route("/api/payjoin", post(payjoin_handler))
@@ -149,9 +155,44 @@ async fn lightning_handler(
     State(state): State<SharedState>,
     Json(payload): Json<LightningRequest>,
 ) -> Result<Json<LightningResponse>, AppError> {
-    let payment_hash = pay_lightning(state.clone(), payload.clone()).await?;
+    let payment_hash = pay_lightning(state, &payload.bolt11).await?;
 
     Ok(Json(LightningResponse { payment_hash }))
+}
+
+#[axum::debug_handler]
+async fn lnurlw_handler() -> Result<Json<WithdrawalResponse>, AppError> {
+    let resp = WithdrawalResponse {
+        default_description: "Mutinynet Facuet".to_string(),
+        callback: "https://faucet.mutinynet.com/api/lnurlw/callback".to_string(),
+        k1: "k1".to_string(),
+        max_withdrawable: MAX_SEND_AMOUNT,
+        min_withdrawable: None,
+        tag: Tag::WithdrawRequest,
+    };
+
+    Ok(Json(resp))
+}
+
+#[derive(Deserialize)]
+pub struct LnurlWithdrawParams {
+    k1: String,
+    pr: String,
+}
+
+#[axum::debug_handler]
+async fn lnurlw_callback_handler(
+    State(state): State<SharedState>,
+    Query(payload): Query<LnurlWithdrawParams>,
+) -> Result<Json<Value>, Json<Value>> {
+    if payload.k1 == "k1" {
+        pay_lightning(state, &payload.pr)
+            .await
+            .map_err(|e| Json(json!({"status": "ERROR", "reason": format!("{e}")})))?;
+        Ok(Json(json!({"status": "OK"})))
+    } else {
+        Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})))
+    }
 }
 
 #[axum::debug_handler]
