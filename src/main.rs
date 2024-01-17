@@ -153,7 +153,7 @@ async fn lnurlw_handler() -> Result<Json<WithdrawalResponse>, AppError> {
         default_description: "Mutinynet Facuet".to_string(),
         callback: "https://faucet.mutinynet.com/api/lnurlw/callback".to_string(),
         k1: "k1".to_string(),
-        max_withdrawable: MAX_SEND_AMOUNT,
+        max_withdrawable: MAX_SEND_AMOUNT * 1_000,
         min_withdrawable: None,
         tag: Tag::WithdrawRequest,
     };
