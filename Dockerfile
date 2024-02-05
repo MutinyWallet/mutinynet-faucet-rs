@@ -1,4 +1,5 @@
-FROM rust:1.67.0
+# Build Stage
+FROM rust:1.67.0 AS builder
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang cmake build-essential
 
@@ -8,4 +9,11 @@ COPY . .
 
 RUN cargo build --release
 
-ENTRYPOINT ["/bin/bash", "-c", "./target/release/mutinynet-faucet-rs ${FLAGS}"]
+# Run Stage
+FROM debian:buster-slim
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/mutinynet-faucet-rs /app/mutinynet-faucet-rs
+
+ENTRYPOINT ["/bin/bash", "-c", "./mutinynet-faucet-rs ${FLAGS}"]
