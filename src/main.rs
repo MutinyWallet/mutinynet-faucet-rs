@@ -1,5 +1,3 @@
-use std::{net::SocketAddr, sync::Arc};
-
 use axum::extract::Query;
 use axum::http::Uri;
 use axum::{
@@ -11,13 +9,17 @@ use axum::{
 use bitcoincore_rpc::Client;
 use lnurl::withdraw::WithdrawalResponse;
 use lnurl::Tag;
+use log::error;
+use nostr::key::Keys;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::{net::SocketAddr, sync::Arc};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::oneshot;
 use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{AllowHeaders, AllowMethods, Any, CorsLayer};
 
+use crate::nostr_dms::listen_to_nostr_dms;
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
 use channel::{open_channel, ChannelRequest, ChannelResponse};
 use lightning::{pay_lightning, LightningRequest, LightningResponse};
@@ -27,12 +29,14 @@ use setup::setup;
 mod bolt11;
 mod channel;
 mod lightning;
+mod nostr_dms;
 mod onchain;
 mod setup;
 
 #[derive(Clone)]
 pub struct AppState {
     pub host: String,
+    keys: Keys,
     network: bitcoin::Network,
     lightning_client: LndLightningClient,
     bitcoin_client: Arc<Client>,
@@ -41,12 +45,14 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         host: String,
+        keys: Keys,
         lightning_client: LndLightningClient,
         bitcoin_client: Client,
         network: bitcoin::Network,
     ) -> Self {
         AppState {
             host,
+            keys,
             network,
             lightning_client,
             bitcoin_client: Arc::new(bitcoin_client),
@@ -69,13 +75,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/bolt11", post(bolt11_handler))
         .route("/api/channel", post(channel_handler))
         .fallback(fallback)
-        .layer(Extension(state))
+        .layer(Extension(state.clone()))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_headers(AllowHeaders::any())
                 .allow_methods(AllowMethods::any()),
         );
+
+    // start dm listener thread
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = listen_to_nostr_dms(state.clone()).await {
+                error!("Error listening to nostr dms: {e}");
+            }
+        }
+    });
 
     // Set up a oneshot channel to handle shutdown signal
     let (tx, rx) = oneshot::channel();

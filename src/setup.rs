@@ -1,7 +1,7 @@
 use bitcoincore_rpc::{Auth, Client, RpcApi};
-use tonic_openssl_lnd::lnrpc;
-
+use nostr::key::{FromSkStr, Keys};
 use std::env;
+use tonic_openssl_lnd::lnrpc;
 
 use crate::AppState;
 
@@ -12,6 +12,11 @@ pub async fn setup() -> AppState {
     dotenv::dotenv().ok();
 
     let host = env::var("HOST").expect("missing HOST");
+
+    // read keys from env, otherwise generate one
+    let keys = env::var("NSEC")
+        .map(|k| Keys::from_sk_str(&k).expect("Invalid nsec"))
+        .unwrap_or(Keys::generate());
 
     let network = env::var("NETWORK").expect("missing NETWORK");
 
@@ -65,5 +70,5 @@ pub async fn setup() -> AppState {
         rpc
     };
 
-    AppState::new(host, lightning_client, bitcoin_client, network)
+    AppState::new(host, keys, lightning_client, bitcoin_client, network)
 }
