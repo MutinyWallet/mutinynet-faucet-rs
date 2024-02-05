@@ -64,7 +64,6 @@ const MAX_SEND_AMOUNT: u64 = 10_000_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    pretty_env_logger::try_init()?;
     let state = setup().await;
 
     let app = Router::new()

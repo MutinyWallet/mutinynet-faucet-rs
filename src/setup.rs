@@ -10,6 +10,8 @@ pub async fn setup() -> AppState {
     dotenv::from_filename(".env.local").ok();
     dotenv::from_filename(".env").ok();
     dotenv::dotenv().ok();
+    // log env logger after dotenv
+    pretty_env_logger::try_init()?;
 
     let host = env::var("HOST").expect("missing HOST");
 
