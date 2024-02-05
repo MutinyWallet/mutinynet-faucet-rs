@@ -3,7 +3,6 @@ use bitcoin_waila::PaymentParams;
 use bitcoincore_rpc::RpcApi;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 use tokio::task;
 
 use crate::{AppState, MAX_SEND_AMOUNT};
@@ -19,19 +18,13 @@ pub struct OnchainResponse {
     pub txid: String,
 }
 
-pub async fn pay_onchain(
-    state: Arc<Mutex<AppState>>,
-    payload: OnchainRequest,
-) -> anyhow::Result<String> {
+pub async fn pay_onchain(state: AppState, payload: OnchainRequest) -> anyhow::Result<String> {
     if payload.sats > MAX_SEND_AMOUNT {
         anyhow::bail!("max amount is 10,000,000");
     }
 
     let txid = {
-        let network = state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to get lock"))?
-            .network;
+        let network = state.network;
 
         // need to convert from different rust-bitcoin versions
         let params = PaymentParams::from_str(&payload.address)
@@ -50,11 +43,7 @@ pub async fn pay_onchain(
             )
         };
 
-        let bitcoin_client = state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to get lock"))?
-            .bitcoin_client
-            .clone();
+        let bitcoin_client = state.bitcoin_client.clone();
 
         let amount = Amount::from_sat(payload.sats);
 

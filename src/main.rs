@@ -1,16 +1,12 @@
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::extract::Query;
 use axum::http::Uri;
 use axum::{
-    extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use bitcoincore_rpc::Client;
 use lnurl::withdraw::WithdrawalResponse;
@@ -34,6 +30,7 @@ mod lightning;
 mod onchain;
 mod setup;
 
+#[derive(Clone)]
 pub struct AppState {
     pub host: String,
     network: bitcoin::Network,
@@ -57,8 +54,6 @@ impl AppState {
     }
 }
 
-type SharedState = Arc<Mutex<AppState>>;
-
 const MAX_SEND_AMOUNT: u64 = 10_000_000;
 
 #[tokio::main]
@@ -74,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/bolt11", post(bolt11_handler))
         .route("/api/channel", post(channel_handler))
         .fallback(fallback)
-        .with_state(state)
+        .layer(Extension(state))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -129,17 +124,17 @@ async fn main() -> anyhow::Result<()> {
 
 #[axum::debug_handler]
 async fn onchain_handler(
-    State(state): State<SharedState>,
+    Extension(state): Extension<AppState>,
     Json(payload): Json<OnchainRequest>,
 ) -> Result<Json<OnchainResponse>, AppError> {
-    let txid = pay_onchain(state.clone(), payload.clone()).await?;
+    let txid = pay_onchain(state, payload.clone()).await?;
 
     Ok(Json(OnchainResponse { txid }))
 }
 
 #[axum::debug_handler]
 async fn lightning_handler(
-    State(state): State<SharedState>,
+    Extension(state): Extension<AppState>,
     Json(payload): Json<LightningRequest>,
 ) -> Result<Json<LightningResponse>, AppError> {
     let payment_hash = pay_lightning(state, &payload.bolt11).await?;
@@ -150,7 +145,7 @@ async fn lightning_handler(
 #[axum::debug_handler]
 async fn lnurlw_handler() -> Result<Json<WithdrawalResponse>, AppError> {
     let resp = WithdrawalResponse {
-        default_description: "Mutinynet Facuet".to_string(),
+        default_description: "Mutinynet Faucet".to_string(),
         callback: "https://faucet.mutinynet.com/api/lnurlw/callback".to_string(),
         k1: "k1".to_string(),
         max_withdrawable: MAX_SEND_AMOUNT * 1_000,
@@ -169,7 +164,7 @@ pub struct LnurlWithdrawParams {
 
 #[axum::debug_handler]
 async fn lnurlw_callback_handler(
-    State(state): State<SharedState>,
+    Extension(state): Extension<AppState>,
     Query(payload): Query<LnurlWithdrawParams>,
 ) -> Result<Json<Value>, Json<Value>> {
     if payload.k1 == "k1" {
@@ -184,20 +179,20 @@ async fn lnurlw_callback_handler(
 
 #[axum::debug_handler]
 async fn bolt11_handler(
-    State(state): State<SharedState>,
+    Extension(state): Extension<AppState>,
     Json(payload): Json<Bolt11Request>,
 ) -> Result<Json<Bolt11Response>, AppError> {
-    let bolt11 = request_bolt11(state.clone(), payload.clone()).await?;
+    let bolt11 = request_bolt11(state, payload.clone()).await?;
 
     Ok(Json(Bolt11Response { bolt11 }))
 }
 
 #[axum::debug_handler]
 async fn channel_handler(
-    State(state): State<SharedState>,
+    Extension(state): Extension<AppState>,
     Json(payload): Json<ChannelRequest>,
 ) -> Result<Json<ChannelResponse>, AppError> {
-    let txid = open_channel(state.clone(), payload.clone()).await?;
+    let txid = open_channel(state, payload.clone()).await?;
 
     Ok(Json(ChannelResponse { txid }))
 }

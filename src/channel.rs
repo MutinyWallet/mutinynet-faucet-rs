@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use std::sync::{Arc, Mutex};
 use tonic_openssl_lnd::lnrpc::{self, channel_point};
 
 use crate::{AppState, MAX_SEND_AMOUNT};
@@ -18,10 +17,7 @@ pub struct ChannelResponse {
     pub txid: String,
 }
 
-pub async fn open_channel(
-    state: Arc<Mutex<AppState>>,
-    payload: ChannelRequest,
-) -> anyhow::Result<String> {
+pub async fn open_channel(state: AppState, payload: ChannelRequest) -> anyhow::Result<String> {
     if payload.capacity > MAX_SEND_AMOUNT.try_into().unwrap() {
         anyhow::bail!("max capacity is 10,000,000");
     }
@@ -39,12 +35,7 @@ pub async fn open_channel(
     };
 
     let channel_point = {
-        let mut lightning_client = state
-            .clone()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to get lock"))?
-            .lightning_client
-            .clone();
+        let mut lightning_client = state.lightning_client.clone();
 
         if let Some(host) = payload.host {
             let connected = lightning_client

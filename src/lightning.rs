@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 
 use bitcoin_waila::PaymentParams;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
 use tonic_openssl_lnd::lnrpc;
 
 use crate::{AppState, MAX_SEND_AMOUNT};
@@ -17,7 +16,7 @@ pub struct LightningResponse {
     pub payment_hash: String,
 }
 
-pub async fn pay_lightning(state: Arc<Mutex<AppState>>, bolt11: &str) -> anyhow::Result<String> {
+pub async fn pay_lightning(state: AppState, bolt11: &str) -> anyhow::Result<String> {
     let params = PaymentParams::from_str(bolt11).map_err(|_| anyhow::anyhow!("invalid bolt 11"))?;
 
     let invoice = if let Some(invoice) = params.invoice() {
@@ -34,12 +33,7 @@ pub async fn pay_lightning(state: Arc<Mutex<AppState>>, bolt11: &str) -> anyhow:
     };
 
     let payment_preimage = {
-        let mut lightning_client = state
-            .clone()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to get lock"))?
-            .lightning_client
-            .clone();
+        let mut lightning_client = state.lightning_client.clone();
 
         let response = lightning_client
             .send_payment_sync(lnrpc::SendRequest {

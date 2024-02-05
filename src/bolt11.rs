@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tonic_openssl_lnd::lnrpc;
 
-use std::sync::{Arc, Mutex};
-
 use crate::AppState;
 
 #[derive(Clone, Deserialize)]
@@ -15,17 +13,9 @@ pub struct Bolt11Response {
     pub bolt11: String,
 }
 
-pub async fn request_bolt11(
-    state: Arc<Mutex<AppState>>,
-    payload: Bolt11Request,
-) -> anyhow::Result<String> {
+pub async fn request_bolt11(state: AppState, payload: Bolt11Request) -> anyhow::Result<String> {
     let bolt11 = {
-        let mut lightning_client = state
-            .clone()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("failed to get lock"))?
-            .lightning_client
-            .clone();
+        let mut lightning_client = state.lightning_client.clone();
 
         let mut inv = lnrpc::Invoice {
             ..Default::default()

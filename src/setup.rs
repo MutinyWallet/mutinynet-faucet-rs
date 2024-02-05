@@ -2,11 +2,10 @@ use bitcoincore_rpc::{Auth, Client, RpcApi};
 use tonic_openssl_lnd::lnrpc;
 
 use std::env;
-use std::sync::{Arc, Mutex};
 
 use crate::AppState;
 
-pub async fn setup() -> Arc<Mutex<AppState>> {
+pub async fn setup() -> AppState {
     // Load environment variables from various sources.
     dotenv::from_filename(".env.local").ok();
     dotenv::from_filename(".env").ok();
@@ -66,7 +65,5 @@ pub async fn setup() -> Arc<Mutex<AppState>> {
         rpc
     };
 
-    let state = AppState::new(host, lightning_client, bitcoin_client, network);
-
-    Arc::new(Mutex::new(state))
+    AppState::new(host, lightning_client, bitcoin_client, network)
 }
