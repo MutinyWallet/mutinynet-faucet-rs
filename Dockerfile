@@ -1,7 +1,6 @@
 FROM rust:1.67.0
 
-RUN apt-get update && \
-    apt-get install -y clang cmake build-essential
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang cmake build-essential
 
 WORKDIR /app
 
