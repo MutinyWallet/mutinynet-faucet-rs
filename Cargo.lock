@@ -326,8 +326,8 @@ dependencies = [
  "bip21",
  "bitcoin",
  "itertools 0.12.0",
- "lightning",
- "lightning-invoice",
+ "lightning 0.0.119",
+ "lightning-invoice 0.27.0",
  "lnurl-rs",
  "nostr 0.26.2",
  "url",
@@ -1168,6 +1168,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightning"
+version = "0.0.121"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b0c1f811ae288f86c6767055c55b5f7a721ca1e61bf1897a9ae2ec663e8aba1"
+dependencies = [
+ "bitcoin",
+ "hex-conservative",
+]
+
+[[package]]
 name = "lightning-invoice"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1175,7 +1185,20 @@ checksum = "fd3421ccfaeac77763114f68f3fc5308f11a0e8a880618b4f84d1d22493aa465"
 dependencies = [
  "bech32",
  "bitcoin",
- "lightning",
+ "lightning 0.0.119",
+ "num-traits",
+ "secp256k1",
+]
+
+[[package]]
+name = "lightning-invoice"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b186aca4a605d4db3b85979922be287b9ebd5dedd8132963bb9dbeb8f7d2a04"
+dependencies = [
+ "bech32",
+ "bitcoin",
+ "lightning 0.0.121",
  "num-traits",
  "secp256k1",
 ]
@@ -1298,7 +1321,7 @@ dependencies = [
  "bitcoincore-rpc",
  "dotenv",
  "hex",
- "lightning-invoice",
+ "lightning-invoice 0.29.0",
  "lnurl-rs",
  "log",
  "nostr 0.27.0",
