@@ -5,7 +5,7 @@ use tonic_openssl_lnd::lnrpc;
 
 use crate::AppState;
 
-pub async fn setup() -> AppState {
+pub async fn setup() -> anyhow::Result<AppState> {
     // Load environment variables from various sources.
     dotenv::from_filename(".env.local").ok();
     dotenv::from_filename(".env").ok();
@@ -72,5 +72,11 @@ pub async fn setup() -> AppState {
         rpc
     };
 
-    AppState::new(host, keys, lightning_client, bitcoin_client, network)
+    Ok(AppState::new(
+        host,
+        keys,
+        lightning_client,
+        bitcoin_client,
+        network,
+    ))
 }

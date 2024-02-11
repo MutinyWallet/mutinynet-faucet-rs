@@ -64,7 +64,7 @@ const MAX_SEND_AMOUNT: u64 = 10_000_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let state = setup().await;
+    let state = setup().await?;
 
     let app = Router::new()
         .route("/api/onchain", post(onchain_handler))
