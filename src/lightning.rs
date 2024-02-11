@@ -38,6 +38,7 @@ pub async fn pay_lightning(state: AppState, bolt11: &str) -> anyhow::Result<Stri
         let response = lightning_client
             .send_payment_sync(lnrpc::SendRequest {
                 payment_request: invoice.to_string(),
+                allow_self_payment: true,
                 ..Default::default()
             })
             .await?
