@@ -29,7 +29,7 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
             .kind(Kind::EncryptedDirectMessage)
             .since(Timestamp::now());
 
-        client.subscribe(vec![filter]).await;
+        client.subscribe(vec![filter], None).await;
 
         let mut notifications = client.notifications();
 
@@ -40,7 +40,7 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
                         tokio::spawn({
                             let state = state.clone();
                             async move {
-                                if let Err(e) = handle_event(event, state).await {
+                                if let Err(e) = handle_event(*event, state).await {
                                     error!("Error processing dm: {e}")
                                 }
                             }
@@ -60,7 +60,7 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
 }
 
 async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
-    let decrypted = nip04::decrypt(&state.keys.secret_key()?, &event.pubkey, &event.content)?;
+    let decrypted = nip04::decrypt(state.keys.secret_key()?, &event.pubkey, &event.content)?;
 
     if let Ok(params) = PaymentParams::from_str(&decrypted) {
         if let Some(invoice) = params.invoice() {
