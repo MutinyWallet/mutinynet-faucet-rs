@@ -141,9 +141,9 @@ async fn onchain_handler(
     Extension(state): Extension<AppState>,
     Json(payload): Json<OnchainRequest>,
 ) -> Result<Json<OnchainResponse>, AppError> {
-    let txid = pay_onchain(state, payload.clone()).await?;
+    let res = pay_onchain(state, payload).await?;
 
-    Ok(Json(OnchainResponse { txid }))
+    Ok(Json(res))
 }
 
 #[axum::debug_handler]

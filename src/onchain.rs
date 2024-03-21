@@ -16,14 +16,18 @@ pub struct OnchainRequest {
 #[derive(Clone, Serialize)]
 pub struct OnchainResponse {
     pub txid: String,
+    pub address: String,
 }
 
-pub async fn pay_onchain(state: AppState, payload: OnchainRequest) -> anyhow::Result<String> {
+pub async fn pay_onchain(
+    state: AppState,
+    payload: OnchainRequest,
+) -> anyhow::Result<OnchainResponse> {
     if payload.sats > MAX_SEND_AMOUNT {
         anyhow::bail!("max amount is 10,000,000");
     }
 
-    let txid = {
+    let res = {
         let network = state.network;
 
         // need to convert from different rust-bitcoin versions
@@ -34,7 +38,7 @@ pub async fn pay_onchain(state: AppState, payload: OnchainRequest) -> anyhow::Re
         let address =
             Address::from_str(&address_str.to_string()).map_err(|e| anyhow::anyhow!(e))?;
 
-        let address = if address.is_valid_for_network(network) {
+        let address = if let Ok(address) = address.require_network(network) {
             address
         } else {
             anyhow::bail!(
@@ -47,19 +51,15 @@ pub async fn pay_onchain(state: AppState, payload: OnchainRequest) -> anyhow::Re
 
         let amount = Amount::from_sat(payload.sats);
 
-        task::block_in_place(|| {
-            bitcoin_client.send_to_address(
-                &address.assume_checked(), // we just checked it above,
-                amount,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-        })?
+        let txid = task::block_in_place(|| {
+            bitcoin_client.send_to_address(&address, amount, None, None, None, None, None, None)
+        })?;
+
+        OnchainResponse {
+            txid: txid.to_string(),
+            address: address.to_string(),
+        }
     };
 
-    Ok(txid.to_string())
+    Ok(res)
 }
