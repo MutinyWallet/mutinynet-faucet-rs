@@ -1,4 +1,4 @@
-FROM rust:1.67.0 AS builder
+FROM rust:1.76.0 AS builder
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang cmake build-essential
 
