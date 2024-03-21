@@ -9,7 +9,7 @@ use crate::{AppState, MAX_SEND_AMOUNT};
 
 #[derive(Clone, Deserialize)]
 pub struct OnchainRequest {
-    sats: u64,
+    sats: Option<u64>,
     address: String,
 }
 
@@ -23,10 +23,6 @@ pub async fn pay_onchain(
     state: AppState,
     payload: OnchainRequest,
 ) -> anyhow::Result<OnchainResponse> {
-    if payload.sats > MAX_SEND_AMOUNT {
-        anyhow::bail!("max amount is 10,000,000");
-    }
-
     let res = {
         let network = state.network;
 
@@ -49,7 +45,14 @@ pub async fn pay_onchain(
 
         let bitcoin_client = state.bitcoin_client.clone();
 
-        let amount = Amount::from_sat(payload.sats);
+        let amount = params
+            .amount()
+            .or(payload.sats.map(Amount::from_sat))
+            .ok_or(anyhow::anyhow!("invalid amount"))?;
+
+        if amount.to_sat() > MAX_SEND_AMOUNT {
+            anyhow::bail!("max amount is 10,000,000");
+        }
 
         let txid = task::block_in_place(|| {
             bitcoin_client.send_to_address(&address, amount, None, None, None, None, None, None)
