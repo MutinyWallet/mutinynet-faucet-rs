@@ -1,4 +1,4 @@
-use crate::AppState;
+use crate::{AppState, MAX_SEND_AMOUNT};
 use bitcoin_waila::PaymentParams;
 use log::{error, warn};
 use nostr::nips::nip04;
@@ -64,21 +64,27 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
 
     if let Ok(params) = PaymentParams::from_str(&decrypted) {
         if let Some(invoice) = params.invoice() {
-            let mut lightning_client = state.lightning_client.clone();
+            // only pay if invoice has a valid amount
+            if invoice
+                .amount_milli_satoshis()
+                .is_some_and(|amt| amt / 1_000 > MAX_SEND_AMOUNT)
+            {
+                let mut lightning_client = state.lightning_client.clone();
 
-            let response = lightning_client
-                .send_payment_sync(lnrpc::SendRequest {
-                    payment_request: invoice.to_string(),
-                    ..Default::default()
-                })
-                .await?
-                .into_inner();
+                let response = lightning_client
+                    .send_payment_sync(lnrpc::SendRequest {
+                        payment_request: invoice.to_string(),
+                        ..Default::default()
+                    })
+                    .await?
+                    .into_inner();
 
-            if !response.payment_error.is_empty() {
-                return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
+                if !response.payment_error.is_empty() {
+                    return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
+                }
+
+                return Ok(());
             }
-
-            return Ok(());
         }
         // can add handling for more types in the future
     }
