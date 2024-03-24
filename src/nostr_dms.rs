@@ -1,6 +1,8 @@
 use crate::{AppState, MAX_SEND_AMOUNT};
+use bitcoin::Amount;
 use bitcoin_waila::PaymentParams;
-use log::{error, warn};
+use bitcoincore_rpc::RpcApi;
+use log::{error, info, warn};
 use nostr::nips::nip04;
 use nostr::{Event, Filter, Kind, Timestamp};
 use nostr_sdk::{Client, RelayPoolNotification};
@@ -86,6 +88,22 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
+
+        if let Some(address) = params.address() {
+            let amount = params.amount().unwrap_or(Amount::from_sat(100_000));
+
+            if amount.to_sat() > MAX_SEND_AMOUNT {
+                return Err(anyhow::anyhow!("Amount exceeds max send amount"));
+            }
+
+            let txid = state
+                .bitcoin_client
+                .send_to_address(&address, amount, None, None, None, None, None, None)?;
+
+            info!("Sent onchain tx: {txid}");
+            return Ok(());
+        }
+
         // can add handling for more types in the future
     }
 
