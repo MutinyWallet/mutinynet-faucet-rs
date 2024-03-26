@@ -8,7 +8,7 @@ use axum::{
 };
 use bitcoincore_rpc::Client;
 use lnurl::withdraw::WithdrawalResponse;
-use lnurl::Tag;
+use lnurl::{AsyncClient, Tag};
 use log::error;
 use nostr::key::Keys;
 use serde::Deserialize;
@@ -40,6 +40,7 @@ pub struct AppState {
     network: bitcoin::Network,
     lightning_client: LndLightningClient,
     bitcoin_client: Arc<Client>,
+    lnurl: AsyncClient,
 }
 
 impl AppState {
@@ -50,12 +51,14 @@ impl AppState {
         bitcoin_client: Client,
         network: bitcoin::Network,
     ) -> Self {
+        let lnurl = lnurl::Builder::default().build_async().unwrap();
         AppState {
             host,
             keys,
             network,
             lightning_client,
             bitcoin_client: Arc::new(bitcoin_client),
+            lnurl,
         }
     }
 }

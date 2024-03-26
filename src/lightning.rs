@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use bitcoin_waila::PaymentParams;
+use lightning_invoice::Bolt11Invoice;
+use lnurl::LnUrlResponse;
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
 
@@ -28,8 +30,22 @@ pub async fn pay_lightning(state: AppState, bolt11: &str) -> anyhow::Result<Stri
         } else {
             anyhow::bail!("bolt11 invoice should have an amount");
         }
+    } else if let Some(lnurl) = params.lnurl() {
+        match state.lnurl.make_request(&lnurl.url).await? {
+            LnUrlResponse::LnUrlPayResponse(pay) => {
+                if pay.min_sendable > MAX_SEND_AMOUNT {
+                    anyhow::bail!("max amount is 10,000,000");
+                }
+                let inv = state
+                    .lnurl
+                    .get_invoice(&pay, pay.min_sendable, None, None)
+                    .await?;
+                Bolt11Invoice::from_str(inv.invoice())?
+            }
+            _ => anyhow::bail!("invalid lnurl"),
+        }
     } else {
-        anyhow::bail!("invalid bolt11");
+        anyhow::bail!("invalid bolt11")
     };
 
     let payment_preimage = {
