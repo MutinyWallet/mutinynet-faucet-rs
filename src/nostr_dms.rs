@@ -73,7 +73,7 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
             // only pay if invoice has a valid amount
             if invoice
                 .amount_milli_satoshis()
-                .is_some_and(|amt| amt / 1_000 > MAX_SEND_AMOUNT)
+                .is_some_and(|amt| amt / 1_000 < MAX_SEND_AMOUNT)
             {
                 let mut lightning_client = state.lightning_client.clone();
 
