@@ -4,7 +4,7 @@ use bitcoin_waila::PaymentParams;
 use bitcoincore_rpc::RpcApi;
 use log::{error, info, warn};
 use nostr::nips::nip04;
-use nostr::{Event, Filter, Kind, Timestamp};
+use nostr::{Event, Filter, JsonUtil, Kind, Timestamp};
 use nostr_sdk::{Client, RelayPoolNotification};
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
@@ -39,6 +39,7 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
             match notification {
                 RelayPoolNotification::Event { event, .. } => {
                     if event.kind == Kind::EncryptedDirectMessage {
+                        info!("Received dm: {}", event.as_json());
                         tokio::spawn({
                             let state = state.clone();
                             async move {
@@ -47,6 +48,8 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
                                 }
                             }
                         });
+                    } else {
+                        warn!("Received unexpected event: {}", event.as_json());
                     }
                 }
                 RelayPoolNotification::Shutdown => {
@@ -62,6 +65,7 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
 }
 
 async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
+    event.verify()?;
     let decrypted = nip04::decrypt(state.keys.secret_key()?, &event.pubkey, &event.content)?;
 
     if let Ok(params) = PaymentParams::from_str(&decrypted) {
