@@ -75,6 +75,7 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 .amount_milli_satoshis()
                 .is_some_and(|amt| amt / 1_000 < MAX_SEND_AMOUNT)
             {
+                info!("Paying invoice: {invoice}");
                 let mut lightning_client = state.lightning_client.clone();
 
                 let response = lightning_client
@@ -90,6 +91,8 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 }
 
                 return Ok(());
+            } else {
+                return Err(anyhow::anyhow!("Invalid invoice amount"));
             }
         }
 
