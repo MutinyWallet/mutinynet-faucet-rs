@@ -9,7 +9,7 @@ use lnurl::LnUrlResponse;
 use log::{error, info, warn};
 use nostr::nips::nip04;
 use nostr::prelude::ZapRequestData;
-use nostr::{Event, EventBuilder, Filter, JsonUtil, Kind, Metadata, Timestamp, UncheckedUrl};
+use nostr::{nips, Event, Filter, JsonUtil, Kind, Metadata, Timestamp, UncheckedUrl};
 use nostr_sdk::{Client, RelayPoolNotification};
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
@@ -99,19 +99,21 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
 
         let invoice = match state.lnurl.make_request(&lnurl.url).await? {
             LnUrlResponse::LnUrlPayResponse(pay) => {
-                if pay.min_sendable > MAX_SEND_AMOUNT {
+                let amount_msats = pay.min_sendable * 2;
+                if amount_msats > MAX_SEND_AMOUNT {
                     anyhow::bail!("max amount is 10,000,000");
                 }
 
                 let relays = RELAYS.iter().map(|r| UncheckedUrl::new(*r));
                 let zap_data = ZapRequestData::new(event.pubkey, relays)
                     .lnurl(lnurl.encode())
-                    .amount(pay.min_sendable);
-                let zap = EventBuilder::public_zap_request(zap_data).to_event(&state.keys)?;
+                    .amount(amount_msats)
+                    .message("This is a private zap 👻");
+                let zap = nips::nip57::private_zap_request(zap_data, &state.keys)?;
 
                 let inv = state
                     .lnurl
-                    .get_invoice(&pay, pay.min_sendable, Some(zap.as_json()), None)
+                    .get_invoice(&pay, amount_msats, Some(zap.as_json()), None)
                     .await?;
                 Bolt11Invoice::from_str(inv.invoice())?
             }
