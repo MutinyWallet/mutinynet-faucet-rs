@@ -2,9 +2,14 @@ use crate::{AppState, MAX_SEND_AMOUNT};
 use bitcoin::Amount;
 use bitcoin_waila::PaymentParams;
 use bitcoincore_rpc::RpcApi;
+use lightning_invoice::Bolt11Invoice;
+use lnurl::lightning_address::LightningAddress;
+use lnurl::lnurl::LnUrl;
+use lnurl::LnUrlResponse;
 use log::{error, info, warn};
 use nostr::nips::nip04;
-use nostr::{Event, Filter, JsonUtil, Kind, Timestamp};
+use nostr::prelude::ZapRequestData;
+use nostr::{Event, EventBuilder, Filter, JsonUtil, Kind, Metadata, Timestamp, UncheckedUrl};
 use nostr_sdk::{Client, RelayPoolNotification};
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
@@ -67,6 +72,77 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
 async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
     event.verify()?;
     let decrypted = nip04::decrypt(state.keys.secret_key()?, &event.pubkey, &event.content)?;
+
+    if decrypted.to_lowercase() == "zap me" {
+        info!("Zapping");
+
+        let client = nostr_sdk::Client::default();
+        client.add_relays(RELAYS).await?;
+        client.connect().await;
+
+        let filter = Filter::new()
+            .author(event.pubkey)
+            .kind(Kind::Metadata)
+            .limit(1);
+        let events = client.get_events_of(vec![filter], None).await?;
+        let event = events
+            .into_iter()
+            .max_by_key(|e| e.created_at)
+            .ok_or(anyhow::anyhow!("no event"))?;
+
+        let metadata = Metadata::from_json(&event.content)?;
+        let lnurl = metadata
+            .lud16
+            .and_then(|l| LightningAddress::from_str(&l).ok().map(|l| l.lnurl()))
+            .or(metadata.lud06.and_then(|l| LnUrl::decode(l).ok()))
+            .ok_or(anyhow::anyhow!("no lnurl"))?;
+
+        let invoice = match state.lnurl.make_request(&lnurl.url).await? {
+            LnUrlResponse::LnUrlPayResponse(pay) => {
+                if pay.min_sendable > MAX_SEND_AMOUNT {
+                    anyhow::bail!("max amount is 10,000,000");
+                }
+
+                let relays = RELAYS.iter().map(|r| UncheckedUrl::new(*r));
+                let zap_data = ZapRequestData::new(event.pubkey, relays)
+                    .lnurl(lnurl.encode())
+                    .amount(pay.min_sendable);
+                let zap = EventBuilder::public_zap_request(zap_data).to_event(&state.keys)?;
+
+                let inv = state
+                    .lnurl
+                    .get_invoice(&pay, pay.min_sendable, Some(zap.as_json()), None)
+                    .await?;
+                Bolt11Invoice::from_str(inv.invoice())?
+            }
+            _ => anyhow::bail!("invalid lnurl"),
+        };
+
+        // only pay if invoice has a valid amount
+        if invoice
+            .amount_milli_satoshis()
+            .is_some_and(|amt| amt / 1_000 < MAX_SEND_AMOUNT)
+        {
+            info!("Paying invoice: {invoice}");
+            let mut lightning_client = state.lightning_client.clone();
+
+            let response = lightning_client
+                .send_payment_sync(lnrpc::SendRequest {
+                    payment_request: invoice.to_string(),
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+
+            if !response.payment_error.is_empty() {
+                return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
+            }
+
+            return Ok(());
+        } else {
+            return Err(anyhow::anyhow!("Invalid invoice amount"));
+        }
+    }
 
     if let Ok(params) = PaymentParams::from_str(&decrypted) {
         if let Some(invoice) = params.invoice() {
