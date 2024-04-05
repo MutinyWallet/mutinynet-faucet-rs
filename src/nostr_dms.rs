@@ -69,6 +69,33 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
     }
 }
 
+async fn pay_invoice(invoice: Bolt11Invoice, state: &AppState) -> anyhow::Result<()> {
+    // only pay if invoice has a valid amount
+    if invoice
+        .amount_milli_satoshis()
+        .is_some_and(|amt| amt / 1_000 < MAX_SEND_AMOUNT)
+    {
+        info!("Paying invoice: {invoice}");
+        let mut lightning_client = state.lightning_client.clone();
+
+        let response = lightning_client
+            .send_payment_sync(lnrpc::SendRequest {
+                payment_request: invoice.to_string(),
+                ..Default::default()
+            })
+            .await?
+            .into_inner();
+
+        if !response.payment_error.is_empty() {
+            return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
+        }
+
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Invalid invoice amount"))
+    }
+}
+
 async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
     event.verify()?;
     let decrypted = nip04::decrypt(state.keys.secret_key()?, &event.pubkey, &event.content)?;
@@ -122,58 +149,12 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
             _ => anyhow::bail!("invalid lnurl"),
         };
 
-        // only pay if invoice has a valid amount
-        if invoice
-            .amount_milli_satoshis()
-            .is_some_and(|amt| amt / 1_000 < MAX_SEND_AMOUNT)
-        {
-            info!("Paying invoice: {invoice}");
-            let mut lightning_client = state.lightning_client.clone();
-
-            let response = lightning_client
-                .send_payment_sync(lnrpc::SendRequest {
-                    payment_request: invoice.to_string(),
-                    ..Default::default()
-                })
-                .await?
-                .into_inner();
-
-            if !response.payment_error.is_empty() {
-                return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
-            }
-
-            return Ok(());
-        } else {
-            return Err(anyhow::anyhow!("Invalid invoice amount"));
-        }
+        pay_invoice(invoice, &state).await?;
     }
 
     if let Ok(params) = PaymentParams::from_str(&decrypted) {
         if let Some(invoice) = params.invoice() {
-            // only pay if invoice has a valid amount
-            if invoice
-                .amount_milli_satoshis()
-                .is_some_and(|amt| amt / 1_000 < MAX_SEND_AMOUNT)
-            {
-                info!("Paying invoice: {invoice}");
-                let mut lightning_client = state.lightning_client.clone();
-
-                let response = lightning_client
-                    .send_payment_sync(lnrpc::SendRequest {
-                        payment_request: invoice.to_string(),
-                        ..Default::default()
-                    })
-                    .await?
-                    .into_inner();
-
-                if !response.payment_error.is_empty() {
-                    return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
-                }
-
-                return Ok(());
-            } else {
-                return Err(anyhow::anyhow!("Invalid invoice amount"));
-            }
+            pay_invoice(invoice, &state).await?;
         }
 
         if let Some(address) = params.address() {
