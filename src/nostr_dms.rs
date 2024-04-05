@@ -96,60 +96,79 @@ async fn pay_invoice(invoice: Bolt11Invoice, state: &AppState) -> anyhow::Result
     }
 }
 
+async fn get_lnurl(pubkey: nostr::PublicKey) -> anyhow::Result<LnUrl> {
+    let client = Client::default();
+    client.add_relays(RELAYS).await?;
+    client.connect().await;
+
+    let filter = Filter::new().author(pubkey).kind(Kind::Metadata).limit(1);
+    let events = client.get_events_of(vec![filter], None).await?;
+    let event = events
+        .into_iter()
+        .max_by_key(|e| e.created_at)
+        .ok_or(anyhow::anyhow!("no event"))?;
+
+    client.disconnect().await?;
+
+    let metadata = Metadata::from_json(&event.content)?;
+    let lnurl = metadata
+        .lud16
+        .and_then(|l| LightningAddress::from_str(&l).ok().map(|l| l.lnurl()))
+        .or(metadata.lud06.and_then(|l| LnUrl::decode(l).ok()))
+        .ok_or(anyhow::anyhow!("no lnurl"))?;
+
+    Ok(lnurl)
+}
+
+async fn get_invoice(
+    lnurl: &LnUrl,
+    pubkey: nostr::PublicKey,
+    state: &AppState,
+) -> anyhow::Result<Bolt11Invoice> {
+    let invoice = match state.lnurl.make_request(&lnurl.url).await? {
+        LnUrlResponse::LnUrlPayResponse(pay) => {
+            let amount_msats = pay.min_sendable * 2;
+            if amount_msats > MAX_SEND_AMOUNT {
+                anyhow::bail!("max amount is 10,000,000");
+            }
+
+            let relays = RELAYS.iter().map(|r| UncheckedUrl::new(*r));
+            let zap_data = ZapRequestData::new(pubkey, relays)
+                .lnurl(lnurl.encode())
+                .amount(amount_msats)
+                .message("This is a private zap 👻");
+            let zap = nips::nip57::private_zap_request(zap_data, &state.keys)?;
+
+            let inv = state
+                .lnurl
+                .get_invoice(&pay, amount_msats, Some(zap.as_json()), None)
+                .await?;
+            Bolt11Invoice::from_str(inv.invoice())?
+        }
+        _ => anyhow::bail!("invalid lnurl"),
+    };
+
+    Ok(invoice)
+}
+
 async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
     event.verify()?;
     let decrypted = nip04::decrypt(state.keys.secret_key()?, &event.pubkey, &event.content)?;
 
     if decrypted.to_lowercase() == "zap me" {
         info!("Zapping");
-
-        let client = Client::default();
-        client.add_relays(RELAYS).await?;
-        client.connect().await;
-
-        let filter = Filter::new()
-            .author(event.pubkey)
-            .kind(Kind::Metadata)
-            .limit(1);
-        let events = client.get_events_of(vec![filter], None).await?;
-        let event = events
-            .into_iter()
-            .max_by_key(|e| e.created_at)
-            .ok_or(anyhow::anyhow!("no event"))?;
-
-        client.disconnect().await?;
-
-        let metadata = Metadata::from_json(&event.content)?;
-        let lnurl = metadata
-            .lud16
-            .and_then(|l| LightningAddress::from_str(&l).ok().map(|l| l.lnurl()))
-            .or(metadata.lud06.and_then(|l| LnUrl::decode(l).ok()))
-            .ok_or(anyhow::anyhow!("no lnurl"))?;
-
-        let invoice = match state.lnurl.make_request(&lnurl.url).await? {
-            LnUrlResponse::LnUrlPayResponse(pay) => {
-                let amount_msats = pay.min_sendable * 2;
-                if amount_msats > MAX_SEND_AMOUNT {
-                    anyhow::bail!("max amount is 10,000,000");
-                }
-
-                let relays = RELAYS.iter().map(|r| UncheckedUrl::new(*r));
-                let zap_data = ZapRequestData::new(event.pubkey, relays)
-                    .lnurl(lnurl.encode())
-                    .amount(amount_msats)
-                    .message("This is a private zap 👻");
-                let zap = nips::nip57::private_zap_request(zap_data, &state.keys)?;
-
-                let inv = state
-                    .lnurl
-                    .get_invoice(&pay, amount_msats, Some(zap.as_json()), None)
-                    .await?;
-                Bolt11Invoice::from_str(inv.invoice())?
-            }
-            _ => anyhow::bail!("invalid lnurl"),
-        };
+        let lnurl = get_lnurl(event.pubkey).await?;
+        let invoice = get_invoice(&lnurl, event.pubkey, &state).await?;
 
         pay_invoice(invoice, &state).await?;
+    } else if decrypted.to_lowercase() == "spam me" {
+        info!("Spamming");
+        let lnurl = get_lnurl(event.pubkey).await?;
+
+        for _ in 0..100 {
+            let invoice = get_invoice(&lnurl, event.pubkey, &state).await?;
+            pay_invoice(invoice, &state).await?;
+        }
     }
 
     if let Ok(params) = PaymentParams::from_str(&decrypted) {
