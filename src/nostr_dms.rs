@@ -76,7 +76,7 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
     if decrypted.to_lowercase() == "zap me" {
         info!("Zapping");
 
-        let client = nostr_sdk::Client::default();
+        let client = Client::default();
         client.add_relays(RELAYS).await?;
         client.connect().await;
 
@@ -89,6 +89,8 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
             .into_iter()
             .max_by_key(|e| e.created_at)
             .ok_or(anyhow::anyhow!("no event"))?;
+
+        client.disconnect().await?;
 
         let metadata = Metadata::from_json(&event.content)?;
         let lnurl = metadata
