@@ -164,7 +164,7 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
         info!("Spamming");
         let lnurl = get_lnurl(event.pubkey).await?;
 
-        for _ in 0..100 {
+        for _ in 0..25 {
             let invoice = get_invoice(&lnurl, event.pubkey, &state).await?;
             pay_invoice(invoice, &state).await?;
         }
