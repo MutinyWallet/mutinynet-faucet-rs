@@ -14,12 +14,11 @@ use nostr_sdk::{Client, RelayPoolNotification};
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
 
-pub const RELAYS: [&str; 8] = [
+pub const RELAYS: [&str; 7] = [
     "wss://nostr.mutinywallet.com",
     "wss://relay.mutinywallet.com",
     "wss://relay.primal.net",
     "wss://relay.snort.social",
-    "wss://relay.nostr.band",
     "wss://eden.nostr.land",
     "wss://nos.lol",
     "wss://relay.damus.io",
