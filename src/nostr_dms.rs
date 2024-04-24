@@ -1,7 +1,6 @@
 use crate::{AppState, MAX_SEND_AMOUNT};
 use bitcoin::Amount;
 use bitcoin_waila::PaymentParams;
-use bitcoincore_rpc::RpcApi;
 use lightning_invoice::Bolt11Invoice;
 use lnurl::lightning_address::LightningAddress;
 use lnurl::lnurl::LnUrl;
@@ -182,9 +181,18 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 return Err(anyhow::anyhow!("Amount exceeds max send amount"));
             }
 
-            let txid = state
-                .bitcoin_client
-                .send_to_address(&address, amount, None, None, None, None, None, None)?;
+            let resp = {
+                let mut wallet_client = state.lightning_client.clone();
+                let req = tonic_openssl_lnd::lnrpc::SendCoinsRequest {
+                    addr: address.to_string(),
+                    amount: amount.to_sat() as i64,
+                    spend_unconfirmed: true,
+                    ..Default::default()
+                };
+                wallet_client.send_coins(req).await?.into_inner()
+            };
+
+            let txid = resp.txid;
 
             info!("Sent onchain tx: {txid}");
             return Ok(());

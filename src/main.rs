@@ -6,14 +6,13 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-use bitcoincore_rpc::Client;
 use lnurl::withdraw::WithdrawalResponse;
 use lnurl::{AsyncClient, Tag};
 use log::error;
 use nostr::key::Keys;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::oneshot;
 use tonic_openssl_lnd::LndLightningClient;
@@ -39,7 +38,6 @@ pub struct AppState {
     keys: Keys,
     network: bitcoin::Network,
     lightning_client: LndLightningClient,
-    bitcoin_client: Arc<Client>,
     lnurl: AsyncClient,
 }
 
@@ -48,7 +46,6 @@ impl AppState {
         host: String,
         keys: Keys,
         lightning_client: LndLightningClient,
-        bitcoin_client: Client,
         network: bitcoin::Network,
     ) -> Self {
         let lnurl = lnurl::Builder::default().build_async().unwrap();
@@ -57,7 +54,6 @@ impl AppState {
             keys,
             network,
             lightning_client,
-            bitcoin_client: Arc::new(bitcoin_client),
             lnurl,
         }
     }

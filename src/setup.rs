@@ -1,6 +1,6 @@
-use bitcoincore_rpc::{Auth, Client, RpcApi};
-use nostr::key::Keys;
 use std::env;
+
+use nostr::key::Keys;
 use tonic_openssl_lnd::lnrpc;
 
 use crate::AppState;
@@ -58,25 +58,5 @@ pub async fn setup() -> anyhow::Result<AppState> {
         lightning_client
     };
 
-    // Setup bitcoin rpc stuff
-    let bitcoin_client = {
-        let url = env::var("BITCOIN_RPC_HOST_AND_PORT").expect("missing BITCOIN_RPC_HOST_AND_PORT");
-        let user = env::var("BITCOIN_RPC_USER").expect("missing BITCOIN_RPC_USER");
-        let pass = env::var("BITCOIN_RPC_PASSWORD").expect("missing BITCOIN_RPC_PASSWORD");
-        let rpc =
-            Client::new(&url, Auth::UserPass(user, pass)).expect("failed to create RPC client");
-
-        // Make sure we can get info at startup
-        let _blockchain_info = rpc.get_blockchain_info();
-
-        rpc
-    };
-
-    Ok(AppState::new(
-        host,
-        keys,
-        lightning_client,
-        bitcoin_client,
-        network,
-    ))
+    Ok(AppState::new(host, keys, lightning_client, network))
 }

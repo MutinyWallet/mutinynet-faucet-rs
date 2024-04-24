@@ -1,9 +1,7 @@
 use bitcoin::{Address, Amount};
 use bitcoin_waila::PaymentParams;
-use bitcoincore_rpc::RpcApi;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use tokio::task;
 
 use crate::{AppState, MAX_SEND_AMOUNT};
 
@@ -43,8 +41,6 @@ pub async fn pay_onchain(
             )
         };
 
-        let bitcoin_client = state.bitcoin_client.clone();
-
         let amount = params
             .amount()
             .or(payload.sats.map(Amount::from_sat))
@@ -54,12 +50,19 @@ pub async fn pay_onchain(
             anyhow::bail!("max amount is 10,000,000");
         }
 
-        let txid = task::block_in_place(|| {
-            bitcoin_client.send_to_address(&address, amount, None, None, None, None, None, None)
-        })?;
+        let resp = {
+            let mut wallet_client = state.lightning_client.clone();
+            let req = tonic_openssl_lnd::lnrpc::SendCoinsRequest {
+                addr: address.to_string(),
+                amount: amount.to_sat() as i64,
+                spend_unconfirmed: true,
+                ..Default::default()
+            };
+            wallet_client.send_coins(req).await?.into_inner()
+        };
 
         OnchainResponse {
-            txid: txid.to_string(),
+            txid: resp.txid,
             address: address.to_string(),
         }
     };
