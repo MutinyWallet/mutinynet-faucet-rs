@@ -19,6 +19,7 @@ pub struct OnchainResponse {
 
 pub async fn pay_onchain(
     state: AppState,
+    x_forwarded_for: &str,
     payload: OnchainRequest,
 ) -> anyhow::Result<OnchainResponse> {
     let res = {
@@ -60,6 +61,11 @@ pub async fn pay_onchain(
             };
             wallet_client.send_coins(req).await?.into_inner()
         };
+
+        state
+            .payments
+            .add_payment(x_forwarded_for, amount.to_sat())
+            .await;
 
         OnchainResponse {
             txid: resp.txid,

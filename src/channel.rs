@@ -17,7 +17,11 @@ pub struct ChannelResponse {
     pub txid: String,
 }
 
-pub async fn open_channel(state: AppState, payload: ChannelRequest) -> anyhow::Result<String> {
+pub async fn open_channel(
+    state: AppState,
+    x_forwarded_for: &str,
+    payload: ChannelRequest,
+) -> anyhow::Result<String> {
     if payload.capacity > MAX_SEND_AMOUNT.try_into().unwrap() {
         anyhow::bail!("max capacity is 10,000,000");
     }
@@ -83,6 +87,11 @@ pub async fn open_channel(state: AppState, payload: ChannelRequest) -> anyhow::R
         }
         None => anyhow::bail!("failed to open channel"),
     };
+
+    state
+        .payments
+        .add_payment(x_forwarded_for, payload.capacity as u64)
+        .await;
 
     Ok(txid)
 }

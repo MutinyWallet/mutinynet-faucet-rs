@@ -1,4 +1,5 @@
 use axum::extract::Query;
+use axum::headers::{HeaderMap, HeaderValue};
 use axum::http::Uri;
 use axum::{
     http::StatusCode,
@@ -19,6 +20,7 @@ use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{AllowHeaders, AllowMethods, Any, CorsLayer};
 
 use crate::nostr_dms::listen_to_nostr_dms;
+use crate::payments::PaymentsByIp;
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
 use channel::{open_channel, ChannelRequest, ChannelResponse};
 use lightning::{pay_lightning, LightningRequest, LightningResponse};
@@ -30,6 +32,7 @@ mod channel;
 mod lightning;
 mod nostr_dms;
 mod onchain;
+mod payments;
 mod setup;
 
 #[derive(Clone)]
@@ -39,6 +42,7 @@ pub struct AppState {
     network: bitcoin::Network,
     lightning_client: LndLightningClient,
     lnurl: AsyncClient,
+    payments: PaymentsByIp,
 }
 
 impl AppState {
@@ -55,6 +59,7 @@ impl AppState {
             network,
             lightning_client,
             lnurl,
+            payments: PaymentsByIp::new(),
         }
     }
 }
@@ -138,9 +143,20 @@ async fn main() -> anyhow::Result<()> {
 #[axum::debug_handler]
 async fn onchain_handler(
     Extension(state): Extension<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<OnchainRequest>,
 ) -> Result<Json<OnchainResponse>, AppError> {
-    let res = pay_onchain(state, payload).await?;
+    // Extract the X-Forwarded-For header
+    let x_forwarded_for = headers
+        .get("x-forwarded-for")
+        .and_then(|x| HeaderValue::to_str(x).ok())
+        .unwrap_or("Unknown");
+
+    if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT * 10 {
+        return Err(AppError::new("Too many payments"));
+    }
+
+    let res = pay_onchain(state, x_forwarded_for, payload).await?;
 
     Ok(Json(res))
 }
@@ -148,9 +164,20 @@ async fn onchain_handler(
 #[axum::debug_handler]
 async fn lightning_handler(
     Extension(state): Extension<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<LightningRequest>,
 ) -> Result<Json<LightningResponse>, AppError> {
-    let payment_hash = pay_lightning(state, &payload.bolt11).await?;
+    // Extract the X-Forwarded-For header
+    let x_forwarded_for = headers
+        .get("x-forwarded-for")
+        .and_then(|x| HeaderValue::to_str(x).ok())
+        .unwrap_or("Unknown");
+
+    if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT * 10 {
+        return Err(AppError::new("Too many payments"));
+    }
+
+    let payment_hash = pay_lightning(state, x_forwarded_for, &payload.bolt11).await?;
 
     Ok(Json(LightningResponse { payment_hash }))
 }
@@ -178,10 +205,21 @@ pub struct LnurlWithdrawParams {
 #[axum::debug_handler]
 async fn lnurlw_callback_handler(
     Extension(state): Extension<AppState>,
+    headers: HeaderMap,
     Query(payload): Query<LnurlWithdrawParams>,
 ) -> Result<Json<Value>, Json<Value>> {
     if payload.k1 == "k1" {
-        pay_lightning(state, &payload.pr)
+        // Extract the X-Forwarded-For header
+        let x_forwarded_for = headers
+            .get("x-forwarded-for")
+            .and_then(|x| HeaderValue::to_str(x).ok())
+            .unwrap_or("Unknown");
+
+        if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT * 10 {
+            return Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})));
+        }
+
+        pay_lightning(state, x_forwarded_for, &payload.pr)
             .await
             .map_err(|e| Json(json!({"status": "ERROR", "reason": format!("{e}")})))?;
         Ok(Json(json!({"status": "OK"})))
@@ -203,15 +241,32 @@ async fn bolt11_handler(
 #[axum::debug_handler]
 async fn channel_handler(
     Extension(state): Extension<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<ChannelRequest>,
 ) -> Result<Json<ChannelResponse>, AppError> {
-    let txid = open_channel(state, payload.clone()).await?;
+    // Extract the X-Forwarded-For header
+    let x_forwarded_for = headers
+        .get("x-forwarded-for")
+        .and_then(|x| HeaderValue::to_str(x).ok())
+        .unwrap_or("Unknown");
+
+    if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT * 10 {
+        return Err(AppError::new("Too many payments"));
+    }
+
+    let txid = open_channel(state, x_forwarded_for, payload).await?;
 
     Ok(Json(ChannelResponse { txid }))
 }
 
 // Make our own error that wraps `anyhow::Error`.
 struct AppError(anyhow::Error);
+
+impl AppError {
+    fn new(msg: &'static str) -> Self {
+        AppError(anyhow::anyhow!(msg))
+    }
+}
 
 // Tell axum how to convert `AppError` into a response.
 impl IntoResponse for AppError {

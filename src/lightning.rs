@@ -23,7 +23,11 @@ pub struct LightningResponse {
     pub payment_hash: String,
 }
 
-pub async fn pay_lightning(state: AppState, bolt11: &str) -> anyhow::Result<String> {
+pub async fn pay_lightning(
+    state: AppState,
+    x_forwarded_for: &str,
+    bolt11: &str,
+) -> anyhow::Result<String> {
     let params = PaymentParams::from_str(bolt11).map_err(|_| anyhow::anyhow!("invalid bolt 11"))?;
 
     let invoice = if let Some(invoice) = params.invoice() {
@@ -113,6 +117,14 @@ pub async fn pay_lightning(state: AppState, bolt11: &str) -> anyhow::Result<Stri
 
         response.payment_preimage
     };
+
+    state
+        .payments
+        .add_payment(
+            x_forwarded_for,
+            invoice.amount_milli_satoshis().unwrap_or(0),
+        )
+        .await;
 
     Ok(hex::encode(payment_preimage))
 }
