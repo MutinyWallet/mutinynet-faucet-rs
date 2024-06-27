@@ -122,7 +122,7 @@ pub async fn pay_lightning(
         .payments
         .add_payment(
             x_forwarded_for,
-            invoice.amount_milli_satoshis().unwrap_or(0),
+            invoice.amount_milli_satoshis().unwrap_or(0) / 1000,
         )
         .await;
 
