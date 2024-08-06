@@ -57,6 +57,7 @@ pub async fn pay_onchain(
                 addr: address.to_string(),
                 amount: amount.to_sat() as i64,
                 spend_unconfirmed: true,
+                sat_per_vbyte: 1,
                 ..Default::default()
             };
             wallet_client.send_coins(req).await?.into_inner()
