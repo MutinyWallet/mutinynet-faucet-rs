@@ -48,7 +48,7 @@ pub async fn pay_onchain(
             .ok_or(anyhow::anyhow!("invalid amount"))?;
 
         if amount.to_sat() > MAX_SEND_AMOUNT {
-            anyhow::bail!("max amount is 10,000,000");
+            anyhow::bail!("max amount is 1,000,000");
         }
 
         let resp = {

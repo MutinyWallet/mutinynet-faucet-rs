@@ -13,12 +13,7 @@ use nostr_sdk::{Client, RelayPoolNotification};
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
 
-pub const RELAYS: [&str; 4] = [
-    "wss://nostr.mutinywallet.com",
-    "wss://relay.mutinywallet.com",
-    "wss://relay.primal.net",
-    "wss://relay.damus.io",
-];
+pub const RELAYS: [&str; 2] = ["wss://relay.primal.net", "wss://relay.damus.io"];
 
 pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
     loop {
@@ -124,7 +119,7 @@ async fn get_invoice(
         LnUrlResponse::LnUrlPayResponse(pay) => {
             let amount_msats = pay.min_sendable * 2;
             if amount_msats > MAX_SEND_AMOUNT {
-                anyhow::bail!("max amount is 10,000,000");
+                anyhow::bail!("max amount is 1,000,000");
             }
 
             let relays = RELAYS.iter().map(|r| UncheckedUrl::new(*r));

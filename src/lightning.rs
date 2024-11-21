@@ -33,7 +33,7 @@ pub async fn pay_lightning(
     let invoice = if let Some(invoice) = params.invoice() {
         if let Some(msat_amount) = invoice.amount_milli_satoshis() {
             if msat_amount / 1000 > MAX_SEND_AMOUNT {
-                anyhow::bail!("max amount is 10,000,000");
+                anyhow::bail!("max amount is 1,000,000");
             }
             invoice
         } else {
@@ -43,7 +43,7 @@ pub async fn pay_lightning(
         match state.lnurl.make_request(&lnurl.url).await? {
             LnUrlResponse::LnUrlPayResponse(pay) => {
                 if pay.min_sendable > MAX_SEND_AMOUNT {
-                    anyhow::bail!("max amount is 10,000,000");
+                    anyhow::bail!("max amount is 1,000,000");
                 }
                 let inv = state
                     .lnurl
@@ -78,7 +78,7 @@ pub async fn pay_lightning(
         match state.lnurl.make_request(&lnurl.url).await? {
             LnUrlResponse::LnUrlPayResponse(pay) => {
                 if pay.min_sendable > MAX_SEND_AMOUNT {
-                    anyhow::bail!("max amount is 10,000,000");
+                    anyhow::bail!("max amount is 1,000,000");
                 }
 
                 let relays = RELAYS.iter().map(|r| UncheckedUrl::new(*r));

@@ -64,7 +64,7 @@ impl AppState {
     }
 }
 
-const MAX_SEND_AMOUNT: u64 = 10_000_000;
+const MAX_SEND_AMOUNT: u64 = 1_000_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
