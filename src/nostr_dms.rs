@@ -65,7 +65,7 @@ async fn pay_invoice(invoice: Bolt11Invoice, state: &AppState) -> anyhow::Result
         .amount_milli_satoshis()
         .is_some_and(|amt| amt / 1_000 < MAX_SEND_AMOUNT)
     {
-        info!("Paying invoice: {invoice}");
+        info!("Paying invoice: {invoice} from nostr dm");
         let mut lightning_client = state.lightning_client.clone();
 
         let response = lightning_client
@@ -173,9 +173,27 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 return Err(anyhow::anyhow!("Amount exceeds max send amount"));
             }
 
+            if state
+                .payments
+                .get_total_payments(&event.pubkey.to_string())
+                .await
+                > MAX_SEND_AMOUNT * 10
+            {
+                return Err(anyhow::anyhow!("Too many payments"));
+            }
+
+            if state
+                .payments
+                .get_total_payments(&address.to_string())
+                .await
+                > MAX_SEND_AMOUNT
+            {
+                return Err(anyhow::anyhow!("Too many payments"));
+            }
+
             let resp = {
                 let mut wallet_client = state.lightning_client.clone();
-                info!("Sending {amount} to {address}");
+                info!("Sending {amount} to {address} from nostr dm");
                 let req = lnrpc::SendCoinsRequest {
                     addr: address.to_string(),
                     amount: amount.to_sat() as i64,
@@ -185,6 +203,17 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 };
                 wallet_client.send_coins(req).await?.into_inner()
             };
+
+            state
+                .payments
+                .add_payment(&event.pubkey.to_string(), amount.to_sat())
+                .await;
+
+            // track for address too
+            state
+                .payments
+                .add_payment(&address.to_string(), amount.to_sat())
+                .await;
 
             let txid = resp.txid;
 

@@ -156,6 +156,10 @@ async fn onchain_handler(
         return Err(AppError::new("Too many payments"));
     }
 
+    if state.payments.get_total_payments(&payload.address).await > MAX_SEND_AMOUNT {
+        return Err(AppError::new("Too many payments"));
+    }
+
     let res = pay_onchain(state, x_forwarded_for, payload).await?;
 
     Ok(Json(res))

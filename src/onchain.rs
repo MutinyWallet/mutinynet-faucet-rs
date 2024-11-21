@@ -7,8 +7,8 @@ use std::str::FromStr;
 
 #[derive(Clone, Deserialize)]
 pub struct OnchainRequest {
-    sats: Option<u64>,
-    address: String,
+    pub sats: Option<u64>,
+    pub address: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -67,6 +67,12 @@ pub async fn pay_onchain(
         state
             .payments
             .add_payment(x_forwarded_for, amount.to_sat())
+            .await;
+
+        // track for address too
+        state
+            .payments
+            .add_payment(&address.to_string(), amount.to_sat())
             .await;
 
         OnchainResponse {
