@@ -5,6 +5,7 @@ use lightning_invoice::Bolt11Invoice;
 use lnurl::lightning_address::LightningAddress;
 use lnurl::lnurl::LnUrl;
 use lnurl::LnUrlResponse;
+use log::info;
 use nostr::prelude::ZapRequestData;
 use nostr::{EventBuilder, Filter, JsonUtil, Kind, Metadata, UncheckedUrl};
 use std::str::FromStr;
@@ -101,6 +102,8 @@ pub async fn pay_lightning(
 
     let payment_preimage = {
         let mut lightning_client = state.lightning_client.clone();
+
+        info!("Paying invoice {invoice}");
 
         let response = lightning_client
             .send_payment_sync(lnrpc::SendRequest {

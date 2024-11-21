@@ -175,10 +175,12 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
 
             let resp = {
                 let mut wallet_client = state.lightning_client.clone();
-                let req = tonic_openssl_lnd::lnrpc::SendCoinsRequest {
+                info!("Sending {amount} to {address}");
+                let req = lnrpc::SendCoinsRequest {
                     addr: address.to_string(),
                     amount: amount.to_sat() as i64,
                     spend_unconfirmed: true,
+                    sat_per_vbyte: 1,
                     ..Default::default()
                 };
                 wallet_client.send_coins(req).await?.into_inner()

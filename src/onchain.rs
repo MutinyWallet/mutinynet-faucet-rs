@@ -1,9 +1,9 @@
+use crate::{AppState, MAX_SEND_AMOUNT};
 use bitcoin::{Address, Amount};
 use bitcoin_waila::PaymentParams;
+use log::info;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-
-use crate::{AppState, MAX_SEND_AMOUNT};
 
 #[derive(Clone, Deserialize)]
 pub struct OnchainRequest {
@@ -53,6 +53,7 @@ pub async fn pay_onchain(
 
         let resp = {
             let mut wallet_client = state.lightning_client.clone();
+            info!("Sending {amount} to {address}");
             let req = tonic_openssl_lnd::lnrpc::SendCoinsRequest {
                 addr: address.to_string(),
                 amount: amount.to_sat() as i64,
