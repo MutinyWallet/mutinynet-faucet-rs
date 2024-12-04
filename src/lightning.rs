@@ -105,6 +105,14 @@ pub async fn pay_lightning(
 
         info!("Paying invoice {invoice}");
 
+        state
+            .payments
+            .add_payment(
+                x_forwarded_for,
+                invoice.amount_milli_satoshis().unwrap_or(0) / 1000,
+            )
+            .await;
+
         let response = lightning_client
             .send_payment_sync(lnrpc::SendRequest {
                 payment_request: invoice.to_string(),
@@ -120,14 +128,6 @@ pub async fn pay_lightning(
 
         response.payment_preimage
     };
-
-    state
-        .payments
-        .add_payment(
-            x_forwarded_for,
-            invoice.amount_milli_satoshis().unwrap_or(0) / 1000,
-        )
-        .await;
 
     Ok(hex::encode(payment_preimage))
 }

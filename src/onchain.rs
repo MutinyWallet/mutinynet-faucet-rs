@@ -51,6 +51,17 @@ pub async fn pay_onchain(
             anyhow::bail!("max amount is 1,000,000");
         }
 
+        state
+            .payments
+            .add_payment(x_forwarded_for, amount.to_sat())
+            .await;
+
+        // track for address too
+        state
+            .payments
+            .add_payment(&address.to_string(), amount.to_sat())
+            .await;
+
         let resp = {
             let mut wallet_client = state.lightning_client.clone();
             info!("Sending {amount} to {address}");
@@ -63,17 +74,6 @@ pub async fn pay_onchain(
             };
             wallet_client.send_coins(req).await?.into_inner()
         };
-
-        state
-            .payments
-            .add_payment(x_forwarded_for, amount.to_sat())
-            .await;
-
-        // track for address too
-        state
-            .payments
-            .add_payment(&address.to_string(), amount.to_sat())
-            .await;
 
         OnchainResponse {
             txid: resp.txid,

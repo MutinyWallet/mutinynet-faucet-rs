@@ -191,6 +191,17 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 return Err(anyhow::anyhow!("Too many payments"));
             }
 
+            state
+                .payments
+                .add_payment(&event.pubkey.to_string(), amount.to_sat())
+                .await;
+
+            // track for address too
+            state
+                .payments
+                .add_payment(&address.to_string(), amount.to_sat())
+                .await;
+
             let resp = {
                 let mut wallet_client = state.lightning_client.clone();
                 info!("Sending {amount} to {address} from nostr dm");
@@ -203,17 +214,6 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 };
                 wallet_client.send_coins(req).await?.into_inner()
             };
-
-            state
-                .payments
-                .add_payment(&event.pubkey.to_string(), amount.to_sat())
-                .await;
-
-            // track for address too
-            state
-                .payments
-                .add_payment(&address.to_string(), amount.to_sat())
-                .await;
 
             let txid = resp.txid;
 
