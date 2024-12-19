@@ -1,12 +1,16 @@
 use axum::extract::Query;
 use axum::headers::{HeaderMap, HeaderValue};
 use axum::http::Uri;
+use axum::response::Redirect;
 use axum::{
     http::StatusCode,
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Json, Router,
 };
+use bitcoin_waila::PaymentParams;
+use jsonwebtoken::{encode, EncodingKey, Header};
 use lnurl::withdraw::WithdrawalResponse;
 use lnurl::{AsyncClient, Tag};
 use log::error;
@@ -14,11 +18,13 @@ use nostr::key::Keys;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::oneshot;
 use tonic_openssl_lnd::LndLightningClient;
-use tower_http::cors::{AllowHeaders, AllowMethods, Any, CorsLayer};
+use tower_http::cors::{AllowMethods, Any, CorsLayer};
 
+use crate::auth::{auth_middleware, AuthState, AuthUser, GithubCallback};
 use crate::nostr_dms::listen_to_nostr_dms;
 use crate::payments::PaymentsByIp;
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
@@ -27,6 +33,7 @@ use lightning::{pay_lightning, LightningRequest, LightningResponse};
 use onchain::{pay_onchain, OnchainRequest, OnchainResponse};
 use setup::setup;
 
+mod auth;
 mod bolt11;
 mod channel;
 mod lightning;
@@ -43,6 +50,7 @@ pub struct AppState {
     lightning_client: LndLightningClient,
     lnurl: AsyncClient,
     payments: PaymentsByIp,
+    auth: AuthState,
 }
 
 impl AppState {
@@ -51,6 +59,7 @@ impl AppState {
         keys: Keys,
         lightning_client: LndLightningClient,
         network: bitcoin::Network,
+        auth: AuthState,
     ) -> Self {
         let lnurl = lnurl::Builder::default().build_async().unwrap();
         AppState {
@@ -60,6 +69,7 @@ impl AppState {
             lightning_client,
             lnurl,
             payments: PaymentsByIp::new(),
+            auth,
         }
     }
 }
@@ -70,8 +80,13 @@ const MAX_SEND_AMOUNT: u64 = 1_000_000;
 async fn main() -> anyhow::Result<()> {
     let state = setup().await?;
 
-    let app = Router::new()
-        .route("/api/onchain", post(onchain_handler))
+    let app: Router = Router::new()
+        .route("/auth/github", get(github_auth))
+        .route("/auth/github/callback", get(github_callback))
+        .route(
+            "/api/onchain",
+            post(onchain_handler).route_layer(middleware::from_fn(auth_middleware)),
+        )
         .route("/api/lightning", post(lightning_handler))
         .route("/api/lnurlw", get(lnurlw_handler))
         .route("/api/lnurlw/callback", get(lnurlw_callback_handler))
@@ -82,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
-                .allow_headers(AllowHeaders::any())
+                .allow_headers([axum::http::header::AUTHORIZATION])
                 .allow_methods(AllowMethods::any()),
         );
 
@@ -141,8 +156,95 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[axum::debug_handler]
+async fn github_auth(Extension(state): Extension<AppState>) -> Result<Redirect, AppError> {
+    let redirect_url = format!(
+        "https://github.com/login/oauth/authorize?client_id={}&scope=user:email&redirect_uri={}/auth/github/callback",
+        state.auth.github_client_id,
+        state.host
+    );
+    Ok(Redirect::temporary(&redirect_url))
+}
+
+#[derive(Deserialize)]
+struct GithubEmail {
+    email: String,
+    primary: bool,
+    verified: bool,
+}
+
+#[axum::debug_handler]
+async fn github_callback(
+    Query(params): Query<GithubCallback>,
+    Extension(state): Extension<AppState>,
+) -> Result<Redirect, StatusCode> {
+    // Exchange code for access token
+    let token_response = state
+        .auth
+        .client
+        .post("https://github.com/login/oauth/access_token")
+        .header("Accept", "application/json")
+        .json(&json!({
+            "client_id": state.auth.github_client_id,
+            "client_secret": state.auth.github_client_secret,
+            "code": params.code,
+        }))
+        .send()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .json::<auth::GithubTokenResponse>()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Get user info
+    // Get user's email
+    let user_emails = state
+        .auth
+        .client
+        .get("https://api.github.com/user/emails")
+        .header(
+            "Authorization",
+            format!("Bearer {}", token_response.access_token),
+        )
+        .header("User-Agent", "rust-github-oauth")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .json::<Vec<GithubEmail>>()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Find primary email
+    let primary_email = user_emails
+        .into_iter()
+        .find(|email| email.primary && email.verified)
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Create JWT
+    let claims = auth::TokenClaims {
+        sub: primary_email.email,
+        exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp() as usize,
+        iat: chrono::Utc::now().timestamp() as usize,
+    };
+
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(state.auth.jwt_secret.as_bytes()),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Redirect to frontend with token
+    Ok(Redirect::temporary(&format!(
+        "{}/?token={token}",
+        state.host
+    )))
+}
+
+#[axum::debug_handler]
 async fn onchain_handler(
     Extension(state): Extension<AppState>,
+    Extension(user): Extension<AuthUser>,
     headers: HeaderMap,
     Json(payload): Json<OnchainRequest>,
 ) -> Result<Json<OnchainResponse>, AppError> {
@@ -152,15 +254,19 @@ async fn onchain_handler(
         .and_then(|x| HeaderValue::to_str(x).ok())
         .unwrap_or("Unknown");
 
-    if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT * 10 {
+    let params = PaymentParams::from_str(&payload.address)
+        .map_err(|_| anyhow::anyhow!("invalid address"))?;
+    let address_str = params.address().ok_or(anyhow::anyhow!("invalid address"))?;
+
+    if state
+        .payments
+        .verify_payments(x_forwarded_for, Some(&address_str), Some(&user))
+        .await
+    {
         return Err(AppError::new("Too many payments"));
     }
 
-    if state.payments.get_total_payments(&payload.address).await > MAX_SEND_AMOUNT {
-        return Err(AppError::new("Too many payments"));
-    }
-
-    let res = pay_onchain(state, x_forwarded_for, payload).await?;
+    let res = pay_onchain(&state, x_forwarded_for, user, payload).await?;
 
     Ok(Json(res))
 }
@@ -181,7 +287,7 @@ async fn lightning_handler(
         return Err(AppError::new("Too many payments"));
     }
 
-    let payment_hash = pay_lightning(state, x_forwarded_for, &payload.bolt11).await?;
+    let payment_hash = pay_lightning(&state, x_forwarded_for, &payload.bolt11).await?;
 
     Ok(Json(LightningResponse { payment_hash }))
 }
@@ -223,7 +329,7 @@ async fn lnurlw_callback_handler(
             return Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})));
         }
 
-        pay_lightning(state, x_forwarded_for, &payload.pr)
+        pay_lightning(&state, x_forwarded_for, &payload.pr)
             .await
             .map_err(|e| Json(json!({"status": "ERROR", "reason": format!("{e}")})))?;
         Ok(Json(json!({"status": "OK"})))
@@ -237,7 +343,7 @@ async fn bolt11_handler(
     Extension(state): Extension<AppState>,
     Json(payload): Json<Bolt11Request>,
 ) -> Result<Json<Bolt11Response>, AppError> {
-    let bolt11 = request_bolt11(state, payload.clone()).await?;
+    let bolt11 = request_bolt11(&state, payload.clone()).await?;
 
     Ok(Json(Bolt11Response { bolt11 }))
 }
@@ -258,7 +364,7 @@ async fn channel_handler(
         return Err(AppError::new("Too many payments"));
     }
 
-    let txid = open_channel(state, x_forwarded_for, payload).await?;
+    let txid = open_channel(&state, x_forwarded_for, payload).await?;
 
     Ok(Json(ChannelResponse { txid }))
 }

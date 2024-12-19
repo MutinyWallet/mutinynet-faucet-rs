@@ -25,7 +25,7 @@ pub struct LightningResponse {
 }
 
 pub async fn pay_lightning(
-    state: AppState,
+    state: &AppState,
     x_forwarded_for: &str,
     bolt11: &str,
 ) -> anyhow::Result<String> {
@@ -109,6 +109,8 @@ pub async fn pay_lightning(
             .payments
             .add_payment(
                 x_forwarded_for,
+                None,
+                None,
                 invoice.amount_milli_satoshis().unwrap_or(0) / 1000,
             )
             .await;

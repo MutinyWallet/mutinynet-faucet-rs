@@ -18,7 +18,7 @@ pub struct ChannelResponse {
 }
 
 pub async fn open_channel(
-    state: AppState,
+    state: &AppState,
     x_forwarded_for: &str,
     payload: ChannelRequest,
 ) -> anyhow::Result<String> {
@@ -90,7 +90,7 @@ pub async fn open_channel(
 
     state
         .payments
-        .add_payment(x_forwarded_for, payload.capacity as u64)
+        .add_payment(x_forwarded_for, None, None, payload.capacity as u64)
         .await;
 
     Ok(txid)

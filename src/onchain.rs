@@ -1,3 +1,4 @@
+use crate::auth::AuthUser;
 use crate::{AppState, MAX_SEND_AMOUNT};
 use bitcoin::{Address, Amount};
 use bitcoin_waila::PaymentParams;
@@ -18,8 +19,9 @@ pub struct OnchainResponse {
 }
 
 pub async fn pay_onchain(
-    state: AppState,
+    state: &AppState,
     x_forwarded_for: &str,
+    user: AuthUser,
     payload: OnchainRequest,
 ) -> anyhow::Result<OnchainResponse> {
     let res = {
@@ -53,13 +55,12 @@ pub async fn pay_onchain(
 
         state
             .payments
-            .add_payment(x_forwarded_for, amount.to_sat())
-            .await;
-
-        // track for address too
-        state
-            .payments
-            .add_payment(&address.to_string(), amount.to_sat())
+            .add_payment(
+                x_forwarded_for,
+                Some(&address),
+                Some(&user),
+                amount.to_sat(),
+            )
             .await;
 
         let resp = {

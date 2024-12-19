@@ -13,7 +13,7 @@ pub struct Bolt11Response {
     pub bolt11: String,
 }
 
-pub async fn request_bolt11(state: AppState, payload: Bolt11Request) -> anyhow::Result<String> {
+pub async fn request_bolt11(state: &AppState, payload: Bolt11Request) -> anyhow::Result<String> {
     let bolt11 = {
         let mut lightning_client = state.lightning_client.clone();
 

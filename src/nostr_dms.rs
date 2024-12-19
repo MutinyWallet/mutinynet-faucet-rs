@@ -193,13 +193,12 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
 
             state
                 .payments
-                .add_payment(&event.pubkey.to_string(), amount.to_sat())
-                .await;
-
-            // track for address too
-            state
-                .payments
-                .add_payment(&address.to_string(), amount.to_sat())
+                .add_payment(
+                    &event.pubkey.to_string(),
+                    Some(&address),
+                    None,
+                    amount.to_sat(),
+                )
                 .await;
 
             let resp = {

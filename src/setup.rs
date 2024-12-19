@@ -3,6 +3,7 @@ use std::env;
 use nostr::key::Keys;
 use tonic_openssl_lnd::lnrpc;
 
+use crate::auth::AuthState;
 use crate::AppState;
 
 pub async fn setup() -> anyhow::Result<AppState> {
@@ -14,6 +15,22 @@ pub async fn setup() -> anyhow::Result<AppState> {
     pretty_env_logger::try_init()?;
 
     let host = env::var("HOST").expect("missing HOST");
+
+    // Load environment variables
+    let github_client_id = env::var("GITHUB_CLIENT_ID").expect("GITHUB_CLIENT_ID must be set");
+    let github_client_secret =
+        env::var("GITHUB_CLIENT_SECRET").expect("GITHUB_CLIENT_SECRET must be set");
+    let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+
+    if github_client_id.is_empty() {
+        panic!("GITHUB_CLIENT_ID must be set");
+    }
+    if github_client_secret.is_empty() {
+        panic!("GITHUB_CLIENT_SECRET must be set");
+    }
+    if jwt_secret.is_empty() {
+        panic!("JWT_SECRET must be set");
+    }
 
     // read keys from env, otherwise generate one
     let keys = env::var("NSEC")
@@ -58,5 +75,12 @@ pub async fn setup() -> anyhow::Result<AppState> {
         lightning_client
     };
 
-    Ok(AppState::new(host, keys, lightning_client, network))
+    let auth = AuthState {
+        client: reqwest::Client::new(),
+        github_client_id,
+        github_client_secret,
+        jwt_secret,
+    };
+
+    Ok(AppState::new(host, keys, lightning_client, network, auth))
 }

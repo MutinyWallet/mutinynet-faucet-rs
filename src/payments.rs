@@ -1,3 +1,6 @@
+use crate::auth::AuthUser;
+use crate::MAX_SEND_AMOUNT;
+use bitcoin::Address;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,8 +60,25 @@ impl PaymentsByIp {
         }
     }
 
+    pub async fn add_payment(
+        &self,
+        ip: &str,
+        address: Option<&Address>,
+        user: Option<&AuthUser>,
+        amount: u64,
+    ) {
+        self.add_payment_impl(ip, amount).await;
+        if let Some(address) = address {
+            self.add_payment_impl(&address.to_string(), amount).await;
+        }
+        if let Some(user) = user {
+            self.add_payment_impl(format!("github:{}", user.username).as_str(), amount)
+                .await;
+        }
+    }
+
     // Add a payment to the tracker for the given ip
-    pub async fn add_payment(&self, ip: &str, amount: u64) {
+    async fn add_payment_impl(&self, ip: &str, amount: u64) {
         let mut trackers = self.trackers.lock().await;
         let tracker = trackers
             .entry(ip.to_string())
@@ -73,5 +93,32 @@ impl PaymentsByIp {
             Some(tracker) => tracker.sum_payments(),
             None => 0,
         }
+    }
+
+    pub async fn verify_payments(
+        &self,
+        ip: &str,
+        address: Option<&Address>,
+        user: Option<&AuthUser>,
+    ) -> bool {
+        let mut total = 0;
+        let mut addr_amt = 0;
+        let mut trackers = self.trackers.lock().await;
+        if let Some(tracker) = trackers.get_mut(ip) {
+            total += tracker.sum_payments();
+        }
+        if let Some(address) = address {
+            if let Some(tracker) = trackers.get_mut(&address.to_string()) {
+                let amt = tracker.sum_payments();
+                total += amt;
+                addr_amt = amt;
+            }
+        };
+        if let Some(user) = user {
+            if let Some(tracker) = trackers.get_mut(format!("github:{}", user.username).as_str()) {
+                total += tracker.sum_payments();
+            }
+        }
+        total >= MAX_SEND_AMOUNT * 10 || addr_amt >= MAX_SEND_AMOUNT
     }
 }

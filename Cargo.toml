@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+async-trait = "0.1"
 anyhow = "1.0.70"
 axum = { version = "0.6.20", features = ["macros", "headers"] }
 bitcoin-waila = "0.3.0"
@@ -16,7 +17,6 @@ tonic_openssl_lnd = "0.2.0"
 dotenv = "0.15.0"
 lnurl-rs = "0.4.0"
 hex = "0.4.3"
-bitcoincore-rpc = "0.17.0"
 bitcoin = "0.30.2"
 lightning-invoice = "0.27.0"
 tower-http = { version = "0.4.0", features = ["cors"] }
@@ -24,3 +24,6 @@ log = "0.4.20"
 pretty_env_logger = "0.5.0"
 nostr = "0.29.0"
 nostr-sdk = "0.29.0"
+jsonwebtoken = "9.3.0"
+reqwest = "0.11.23"
+chrono = "0.4.39"
