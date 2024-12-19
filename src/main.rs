@@ -13,7 +13,7 @@ use bitcoin_waila::PaymentParams;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use lnurl::withdraw::WithdrawalResponse;
 use lnurl::{AsyncClient, Tag};
-use log::error;
+use log::{error, info, warn};
 use nostr::key::Keys;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -225,15 +225,18 @@ async fn github_callback(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Find primary email
-    let primary_email = user_emails
+    let primary_email: GithubEmail = user_emails
         .into_iter()
         .find(|email| email.primary && email.verified)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Check if user is banned
     if auth::is_banned(&primary_email.email) {
+        warn!("User {} is banned!", primary_email.email);
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    info!("Authing user with email: {}", primary_email.email);
 
     // Create JWT
     let claims = auth::TokenClaims {
