@@ -161,15 +161,42 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn banned_domains() -> Vec<String> {
+    let mut domains = vec![];
+    let file = std::fs::read_to_string("banned_domains.txt");
+    if let Ok(file) = file {
+        for line in file.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                domains.push(line.to_string());
+            }
+        }
+    }
+    domains
+}
+
 fn get_banned_users() -> Vec<String> {
     let mut banned_users = vec![];
     let file = std::fs::read_to_string("banned_users.txt");
     if let Ok(file) = file {
         for line in file.lines() {
-            banned_users.push(line.to_string());
+            let line = line.trim();
+            if !line.is_empty() {
+                banned_users.push(line.to_string());
+            }
         }
     }
     banned_users
+}
+
+fn is_banned(user: &AuthUser) -> bool {
+    let domains = banned_domains();
+    let user_host = user.username.split('@').last().unwrap_or("");
+    if domains.contains(&user_host.to_lowercase()) {
+        return true;
+    }
+    let banned_users = get_banned_users();
+    banned_users.contains(&user.username)
 }
 
 #[axum::debug_handler]
@@ -265,7 +292,7 @@ async fn onchain_handler(
     headers: HeaderMap,
     Json(payload): Json<OnchainRequest>,
 ) -> Result<Json<OnchainResponse>, AppError> {
-    if get_banned_users().contains(&user.username) {
+    if is_banned(&user) {
         return Err(AppError::new("You are banned"));
     }
 
@@ -299,7 +326,7 @@ async fn lightning_handler(
     headers: HeaderMap,
     Json(payload): Json<LightningRequest>,
 ) -> Result<Json<LightningResponse>, AppError> {
-    if get_banned_users().contains(&user.username) {
+    if is_banned(&user) {
         return Err(AppError::new("You are banned"));
     }
 
@@ -385,7 +412,7 @@ async fn channel_handler(
     headers: HeaderMap,
     Json(payload): Json<ChannelRequest>,
 ) -> Result<Json<ChannelResponse>, AppError> {
-    if get_banned_users().contains(&user.username) {
+    if is_banned(&user) {
         return Err(AppError::new("You are banned"));
     }
 
