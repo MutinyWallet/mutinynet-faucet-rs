@@ -165,44 +165,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn banned_domains() -> Vec<String> {
-    let mut domains = vec![];
-    let file = std::fs::read_to_string("faucet_config/banned_domains.txt");
-    if let Ok(file) = file {
-        for line in file.lines() {
-            let line = line.trim();
-            if !line.is_empty() {
-                domains.push(line.to_string());
-            }
-        }
-    }
-    domains
-}
-
-fn get_banned_users() -> Vec<String> {
-    let mut banned_users = vec![];
-    let file = std::fs::read_to_string("faucet_config/banned_users.txt");
-    if let Ok(file) = file {
-        for line in file.lines() {
-            let line = line.trim();
-            if !line.is_empty() {
-                banned_users.push(line.to_string());
-            }
-        }
-    }
-    banned_users
-}
-
-fn is_banned(user: &AuthUser) -> bool {
-    let domains = banned_domains();
-    let user_host = user.username.split('@').last().unwrap_or("");
-    if domains.contains(&user_host.to_lowercase()) {
-        return true;
-    }
-    let banned_users = get_banned_users();
-    banned_users.contains(&user.username)
-}
-
 #[axum::debug_handler]
 async fn github_auth(Extension(state): Extension<AppState>) -> Result<Redirect, AppError> {
     let redirect_url = format!(
@@ -292,11 +254,8 @@ async fn github_callback(
 #[axum::debug_handler]
 async fn auth_check(
     Extension(_state): Extension<AppState>,
-    Extension(user): Extension<AuthUser>,
+    Extension(_user): Extension<AuthUser>,
 ) -> Result<Json<Value>, AppError> {
-    if is_banned(&user) {
-        return Err(AppError::new("You are banned"));
-    }
     Ok(Json(json!({"status": "OK"})))
 }
 
@@ -307,10 +266,6 @@ async fn onchain_handler(
     headers: HeaderMap,
     Json(payload): Json<OnchainRequest>,
 ) -> Result<Json<OnchainResponse>, AppError> {
-    if is_banned(&user) {
-        return Err(AppError::new("You are banned"));
-    }
-
     // Extract the X-Forwarded-For header
     let x_forwarded_for = headers
         .get("x-forwarded-for")
@@ -341,10 +296,6 @@ async fn lightning_handler(
     headers: HeaderMap,
     Json(payload): Json<LightningRequest>,
 ) -> Result<Json<LightningResponse>, AppError> {
-    if is_banned(&user) {
-        return Err(AppError::new("You are banned"));
-    }
-
     // Extract the X-Forwarded-For header
     let x_forwarded_for = headers
         .get("x-forwarded-for")
@@ -427,10 +378,6 @@ async fn channel_handler(
     headers: HeaderMap,
     Json(payload): Json<ChannelRequest>,
 ) -> Result<Json<ChannelResponse>, AppError> {
-    if is_banned(&user) {
-        return Err(AppError::new("You are banned"));
-    }
-
     // Extract the X-Forwarded-For header
     let x_forwarded_for = headers
         .get("x-forwarded-for")

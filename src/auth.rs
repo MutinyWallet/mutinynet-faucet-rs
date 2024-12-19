@@ -66,6 +66,44 @@ impl IntoResponse for AuthError {
     }
 }
 
+fn banned_domains() -> Vec<String> {
+    let mut domains = vec![];
+    let file = std::fs::read_to_string("faucet_config/banned_domains.txt");
+    if let Ok(file) = file {
+        for line in file.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                domains.push(line.to_string());
+            }
+        }
+    }
+    domains
+}
+
+fn get_banned_users() -> Vec<String> {
+    let mut banned_users = vec![];
+    let file = std::fs::read_to_string("faucet_config/banned_users.txt");
+    if let Ok(file) = file {
+        for line in file.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                banned_users.push(line.to_string());
+            }
+        }
+    }
+    banned_users
+}
+
+fn is_banned(email: &String) -> bool {
+    let domains = banned_domains();
+    let user_host = email.split('@').last().unwrap_or("");
+    if domains.contains(&user_host.to_lowercase()) {
+        return true;
+    }
+    let banned_users = get_banned_users();
+    banned_users.contains(email)
+}
+
 // Middleware extractor for authenticated users
 #[derive(Debug, Clone)]
 pub struct AuthUser {
@@ -98,6 +136,10 @@ pub async fn auth_middleware<B>(
     // Check if token is expired
     let now = chrono::Utc::now().timestamp() as usize;
     if token_data.claims.exp < now {
+        return Err(AuthError::TokenExpired);
+    }
+
+    if is_banned(&token_data.claims.sub) {
         return Err(AuthError::TokenExpired);
     }
 
