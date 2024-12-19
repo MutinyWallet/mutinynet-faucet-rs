@@ -11,6 +11,7 @@ use nostr::{EventBuilder, Filter, JsonUtil, Kind, Metadata, UncheckedUrl};
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
 
+use crate::auth::AuthUser;
 use crate::nostr_dms::RELAYS;
 use crate::{AppState, MAX_SEND_AMOUNT};
 
@@ -27,6 +28,7 @@ pub struct LightningResponse {
 pub async fn pay_lightning(
     state: &AppState,
     x_forwarded_for: &str,
+    user: Option<&AuthUser>,
     bolt11: &str,
 ) -> anyhow::Result<String> {
     let params = PaymentParams::from_str(bolt11).map_err(|_| anyhow::anyhow!("invalid bolt 11"))?;
@@ -110,7 +112,7 @@ pub async fn pay_lightning(
             .add_payment(
                 x_forwarded_for,
                 None,
-                None,
+                user,
                 invoice.amount_milli_satoshis().unwrap_or(0) / 1000,
             )
             .await;

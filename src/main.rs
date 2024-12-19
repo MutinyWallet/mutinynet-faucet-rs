@@ -87,11 +87,17 @@ async fn main() -> anyhow::Result<()> {
             "/api/onchain",
             post(onchain_handler).route_layer(middleware::from_fn(auth_middleware)),
         )
-        .route("/api/lightning", post(lightning_handler))
+        .route(
+            "/api/lightning",
+            post(lightning_handler).route_layer(middleware::from_fn(auth_middleware)),
+        )
         .route("/api/lnurlw", get(lnurlw_handler))
         .route("/api/lnurlw/callback", get(lnurlw_callback_handler))
         .route("/api/bolt11", post(bolt11_handler))
-        .route("/api/channel", post(channel_handler))
+        .route(
+            "/api/channel",
+            post(channel_handler).route_layer(middleware::from_fn(auth_middleware)),
+        )
         .fallback(fallback)
         .layer(Extension(state.clone()))
         .layer(
@@ -274,6 +280,7 @@ async fn onchain_handler(
 #[axum::debug_handler]
 async fn lightning_handler(
     Extension(state): Extension<AppState>,
+    Extension(user): Extension<AuthUser>,
     headers: HeaderMap,
     Json(payload): Json<LightningRequest>,
 ) -> Result<Json<LightningResponse>, AppError> {
@@ -283,11 +290,15 @@ async fn lightning_handler(
         .and_then(|x| HeaderValue::to_str(x).ok())
         .unwrap_or("Unknown");
 
-    if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT * 10 {
+    if state
+        .payments
+        .verify_payments(x_forwarded_for, None, Some(&user))
+        .await
+    {
         return Err(AppError::new("Too many payments"));
     }
 
-    let payment_hash = pay_lightning(&state, x_forwarded_for, &payload.bolt11).await?;
+    let payment_hash = pay_lightning(&state, x_forwarded_for, Some(&user), &payload.bolt11).await?;
 
     Ok(Json(LightningResponse { payment_hash }))
 }
@@ -329,7 +340,7 @@ async fn lnurlw_callback_handler(
             return Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})));
         }
 
-        pay_lightning(&state, x_forwarded_for, &payload.pr)
+        pay_lightning(&state, x_forwarded_for, None, &payload.pr)
             .await
             .map_err(|e| Json(json!({"status": "ERROR", "reason": format!("{e}")})))?;
         Ok(Json(json!({"status": "OK"})))
@@ -351,6 +362,7 @@ async fn bolt11_handler(
 #[axum::debug_handler]
 async fn channel_handler(
     Extension(state): Extension<AppState>,
+    Extension(user): Extension<AuthUser>,
     headers: HeaderMap,
     Json(payload): Json<ChannelRequest>,
 ) -> Result<Json<ChannelResponse>, AppError> {
@@ -360,11 +372,15 @@ async fn channel_handler(
         .and_then(|x| HeaderValue::to_str(x).ok())
         .unwrap_or("Unknown");
 
-    if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT * 10 {
+    if state
+        .payments
+        .verify_payments(x_forwarded_for, None, Some(&user))
+        .await
+    {
         return Err(AppError::new("Too many payments"));
     }
 
-    let txid = open_channel(&state, x_forwarded_for, payload).await?;
+    let txid = open_channel(&state, x_forwarded_for, Some(&user), payload).await?;
 
     Ok(Json(ChannelResponse { txid }))
 }

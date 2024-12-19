@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use tonic_openssl_lnd::lnrpc::{self, channel_point};
 
+use crate::auth::AuthUser;
 use crate::{AppState, MAX_SEND_AMOUNT};
 
 #[derive(Clone, Deserialize)]
@@ -20,6 +21,7 @@ pub struct ChannelResponse {
 pub async fn open_channel(
     state: &AppState,
     x_forwarded_for: &str,
+    user: Option<&AuthUser>,
     payload: ChannelRequest,
 ) -> anyhow::Result<String> {
     if payload.capacity > MAX_SEND_AMOUNT.try_into()? {
@@ -90,7 +92,7 @@ pub async fn open_channel(
 
     state
         .payments
-        .add_payment(x_forwarded_for, None, None, payload.capacity as u64)
+        .add_payment(x_forwarded_for, None, user, payload.capacity as u64)
         .await;
 
     Ok(txid)
