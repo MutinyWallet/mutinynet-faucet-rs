@@ -94,7 +94,7 @@ fn get_banned_users() -> Vec<String> {
     banned_users
 }
 
-fn is_banned(email: &String) -> bool {
+pub fn is_banned(email: &String) -> bool {
     let domains = banned_domains();
     let user_host = email.split('@').last().unwrap_or("");
     if domains.contains(&user_host.to_lowercase()) {

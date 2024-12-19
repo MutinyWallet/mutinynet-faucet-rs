@@ -230,6 +230,11 @@ async fn github_callback(
         .find(|email| email.primary && email.verified)
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Check if user is banned
+    if auth::is_banned(&primary_email.email) {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     // Create JWT
     let claims = auth::TokenClaims {
         sub: primary_email.email,
