@@ -84,6 +84,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/github", get(github_auth))
         .route("/auth/github/callback", get(github_callback))
         .route(
+            "/auth/check",
+            get(auth_check).route_layer(middleware::from_fn(auth_middleware)),
+        )
+        .route(
             "/api/onchain",
             post(onchain_handler).route_layer(middleware::from_fn(auth_middleware)),
         )
@@ -283,6 +287,17 @@ async fn github_callback(
         "{}/?token={token}",
         state.host
     )))
+}
+
+#[axum::debug_handler]
+async fn auth_check(
+    Extension(_state): Extension<AppState>,
+    Extension(user): Extension<AuthUser>,
+) -> Result<Json<Value>, AppError> {
+    if is_banned(&user) {
+        return Err(AppError::new("You are banned"));
+    }
+    Ok(Json(json!({"status": "OK"})))
 }
 
 #[axum::debug_handler]
