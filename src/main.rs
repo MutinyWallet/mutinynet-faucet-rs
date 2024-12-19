@@ -163,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
 
 fn banned_domains() -> Vec<String> {
     let mut domains = vec![];
-    let file = std::fs::read_to_string("banned_domains.txt");
+    let file = std::fs::read_to_string("faucet_config/banned_domains.txt");
     if let Ok(file) = file {
         for line in file.lines() {
             let line = line.trim();
@@ -177,7 +177,7 @@ fn banned_domains() -> Vec<String> {
 
 fn get_banned_users() -> Vec<String> {
     let mut banned_users = vec![];
-    let file = std::fs::read_to_string("banned_users.txt");
+    let file = std::fs::read_to_string("faucet_config/banned_users.txt");
     if let Ok(file) = file {
         for line in file.lines() {
             let line = line.trim();
