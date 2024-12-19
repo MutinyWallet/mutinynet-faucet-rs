@@ -119,6 +119,6 @@ impl PaymentsByIp {
                 total += tracker.sum_payments();
             }
         }
-        total >= MAX_SEND_AMOUNT * 10 || addr_amt >= MAX_SEND_AMOUNT
+        total >= MAX_SEND_AMOUNT || addr_amt >= MAX_SEND_AMOUNT
     }
 }

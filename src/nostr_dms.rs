@@ -177,7 +177,7 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 .payments
                 .get_total_payments(&event.pubkey.to_string())
                 .await
-                > MAX_SEND_AMOUNT * 10
+                > MAX_SEND_AMOUNT
             {
                 return Err(anyhow::anyhow!("Too many payments"));
             }

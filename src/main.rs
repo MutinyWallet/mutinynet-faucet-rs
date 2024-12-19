@@ -355,7 +355,7 @@ async fn lnurlw_callback_handler(
             .and_then(|x| HeaderValue::to_str(x).ok())
             .unwrap_or("Unknown");
 
-        if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT * 10 {
+        if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT {
             return Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})));
         }
 
