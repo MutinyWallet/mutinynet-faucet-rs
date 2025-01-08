@@ -233,7 +233,7 @@ async fn github_callback(
     // Check if user is banned
     if auth::is_banned(&primary_email.email) {
         warn!("User {} is banned!", primary_email.email);
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(StatusCode::BAD_REQUEST);
     }
 
     info!("Authing user with email: {}", primary_email.email);
