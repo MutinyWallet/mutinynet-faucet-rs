@@ -94,7 +94,25 @@ fn get_banned_users() -> Vec<String> {
     banned_users
 }
 
+fn get_whitelisted_users() -> Vec<String> {
+    let mut whitelisted_users = vec![];
+    let file = std::fs::read_to_string("faucet_config/whitelisted_users.txt");
+    if let Ok(file) = file {
+        for line in file.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                whitelisted_users.push(line.to_string());
+            }
+        }
+    }
+    whitelisted_users
+}
+
 pub fn is_banned(email: &String) -> bool {
+    let whitelisted_users = get_whitelisted_users();
+    if whitelisted_users.contains(email) {
+        return false;
+    }
     let domains = banned_domains();
     let user_host = email.split('@').last().unwrap_or("");
     if domains.contains(&user_host.to_lowercase()) {
