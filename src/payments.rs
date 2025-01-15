@@ -101,24 +101,24 @@ impl PaymentsByIp {
         address: Option<&Address>,
         user: Option<&AuthUser>,
     ) -> bool {
-        let mut total = 0;
+        let mut ip_amt = 0;
         let mut addr_amt = 0;
+        let mut user_amt = 0;
         let mut trackers = self.trackers.lock().await;
         if let Some(tracker) = trackers.get_mut(ip) {
-            total += tracker.sum_payments();
+            ip_amt += tracker.sum_payments();
         }
         if let Some(address) = address {
             if let Some(tracker) = trackers.get_mut(&address.to_string()) {
                 let amt = tracker.sum_payments();
-                total += amt;
                 addr_amt = amt;
             }
         };
         if let Some(user) = user {
             if let Some(tracker) = trackers.get_mut(format!("github:{}", user.username).as_str()) {
-                total += tracker.sum_payments();
+                user_amt += tracker.sum_payments();
             }
         }
-        total >= MAX_SEND_AMOUNT || addr_amt >= MAX_SEND_AMOUNT
+        user_amt >= MAX_SEND_AMOUNT || addr_amt >= MAX_SEND_AMOUNT || ip_amt >= MAX_SEND_AMOUNT
     }
 }
