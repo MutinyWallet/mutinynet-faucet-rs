@@ -108,9 +108,31 @@ fn get_whitelisted_users() -> Vec<String> {
     whitelisted_users
 }
 
+fn get_premium_users() -> Vec<String> {
+    let mut premium_users = vec![];
+    let file = std::fs::read_to_string("faucet_config/premium_users.txt");
+    if let Ok(file) = file {
+        for line in file.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                premium_users.push(line.to_string());
+            }
+        }
+    }
+    premium_users
+}
+
+pub fn is_premium(email: &String) -> bool {
+    let premium_users = get_premium_users();
+    premium_users.contains(email)
+}
+
 pub fn is_banned(email: &String) -> bool {
     let whitelisted_users = get_whitelisted_users();
     if whitelisted_users.contains(email) {
+        return false;
+    }
+    if is_premium(email) {
         return false;
     }
     let domains = banned_domains();

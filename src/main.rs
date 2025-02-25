@@ -24,7 +24,7 @@ use tokio::sync::oneshot;
 use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{AllowMethods, Any, CorsLayer};
 
-use crate::auth::{auth_middleware, AuthState, AuthUser, GithubCallback};
+use crate::auth::{auth_middleware, is_premium, AuthState, AuthUser, GithubCallback};
 use crate::nostr_dms::listen_to_nostr_dms;
 use crate::payments::PaymentsByIp;
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
@@ -288,6 +288,7 @@ async fn onchain_handler(
         .payments
         .verify_payments(x_forwarded_for, Some(&address_str), Some(&user))
         .await
+        && !is_premium(&user.username)
     {
         return Err(AppError::new("Too many payments"));
     }
@@ -314,6 +315,7 @@ async fn lightning_handler(
         .payments
         .verify_payments(x_forwarded_for, None, Some(&user))
         .await
+        && !is_premium(&user.username)
     {
         return Err(AppError::new("Too many payments"));
     }
@@ -396,6 +398,7 @@ async fn channel_handler(
         .payments
         .verify_payments(x_forwarded_for, None, Some(&user))
         .await
+        && !is_premium(&user.username)
     {
         return Err(AppError::new("Too many payments"));
     }

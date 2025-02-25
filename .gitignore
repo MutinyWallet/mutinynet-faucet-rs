@@ -1,5 +1,3 @@
 /target
 .env.local
-banned_domains.txt
-banned_users.txt
 /faucet_config
