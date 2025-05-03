@@ -15,7 +15,7 @@ use lnurl::withdraw::WithdrawalResponse;
 use lnurl::{AsyncClient, Tag};
 use log::{error, info, warn};
 use nostr::key::Keys;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     let app: Router = Router::new()
         .route("/auth/github", get(github_auth))
         .route("/auth/github/callback", get(github_callback))
+        .route("/auth/github/device", post(github_device))
         .route(
             "/auth/check",
             get(auth_check).route_layer(middleware::from_fn(auth_middleware)),
@@ -180,6 +181,64 @@ struct GithubEmail {
     email: String,
     primary: bool,
     verified: bool,
+}
+
+#[derive(Serialize)]
+struct DeviceReturn {
+    token: String,
+}
+
+#[axum::debug_handler]
+async fn github_device(
+    Extension(state): Extension<AppState>,
+    Json(params): Json<GithubCallback>,
+) -> Result<Json<DeviceReturn>, StatusCode> {
+    // Get user info
+    // Get user's email
+    let user_emails = state
+        .auth
+        .client
+        .get("https://api.github.com/user/emails")
+        .header("Authorization", format!("Bearer {}", params.code))
+        .header("User-Agent", "rust-github-oauth")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .json::<Vec<GithubEmail>>()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Find primary email
+    let primary_email: GithubEmail = user_emails
+        .into_iter()
+        .find(|email| email.primary && email.verified)
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Check if user is banned
+    if auth::is_banned(&primary_email.email) {
+        warn!("User {} is banned!", primary_email.email);
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    info!("Authing user with email: {}", primary_email.email);
+
+    // Create JWT
+    let claims = auth::TokenClaims {
+        sub: primary_email.email,
+        exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp() as usize,
+        iat: chrono::Utc::now().timestamp() as usize,
+    };
+
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(state.auth.jwt_secret.as_bytes()),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Redirect to frontend with token
+    Ok(Json(DeviceReturn { token }))
 }
 
 #[axum::debug_handler]
