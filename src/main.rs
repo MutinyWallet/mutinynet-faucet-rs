@@ -221,12 +221,15 @@ async fn github_device(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    info!("Authing user with email: {}", primary_email.email);
+    info!(
+        "Authing user with email through device: {}",
+        primary_email.email
+    );
 
     // Create JWT
     let claims = auth::TokenClaims {
         sub: primary_email.email,
-        exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp() as usize,
+        exp: (chrono::Utc::now() + chrono::Duration::days(31)).timestamp() as usize,
         iat: chrono::Utc::now().timestamp() as usize,
     };
 
