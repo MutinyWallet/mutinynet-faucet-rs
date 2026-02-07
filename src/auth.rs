@@ -34,12 +34,6 @@ pub struct GithubTokenResponse {
     pub access_token: String,
 }
 
-#[derive(Deserialize)]
-pub struct GithubUser {
-    pub id: i64,
-    pub login: String,
-}
-
 // Custom error type for auth failures
 #[derive(Debug, Clone, Copy)]
 pub enum AuthError {
