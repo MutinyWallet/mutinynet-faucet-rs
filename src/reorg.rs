@@ -223,9 +223,10 @@ pub async fn generate_reorg_invoice(
         .as_ref()
         .ok_or_else(|| anyhow!("Mainnet LND client not configured"))?;
 
+    let blocks_word = if request.blocks == 1 { "block" } else { "blocks" };
     let memo = format!(
-        "Mutinynet Reorg: {} blocks for user {}",
-        request.blocks, user.username
+        "Mutinynet Reorg: {} {} for user {}",
+        request.blocks, blocks_word, user.username
     );
 
     let add_invoice_request = lnrpc::Invoice {
