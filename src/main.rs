@@ -17,8 +17,11 @@ use log::{error, info, warn};
 use nostr::key::Keys;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::oneshot;
 use tonic_openssl_lnd::LndLightningClient;
@@ -31,6 +34,9 @@ use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
 use channel::{open_channel, ChannelRequest, ChannelResponse};
 use lightning::{pay_lightning, LightningRequest, LightningResponse};
 use onchain::{pay_onchain, OnchainRequest, OnchainResponse};
+use reorg::{
+    generate_reorg_invoice, start_reorg_invoice_listener, ReorgInvoiceRequest, ReorgInvoiceResponse,
+};
 use setup::setup;
 
 mod auth;
@@ -40,6 +46,7 @@ mod lightning;
 mod nostr_dms;
 mod onchain;
 mod payments;
+mod reorg;
 mod setup;
 
 #[derive(Clone)]
@@ -48,18 +55,34 @@ pub struct AppState {
     keys: Keys,
     network: bitcoin::Network,
     lightning_client: LndLightningClient,
+    mainnet_lightning_client: Option<LndLightningClient>,
+    bitcoin_rpc: Option<Arc<bitcoincore_rpc::Client>>,
+    reorg_db: Option<sqlx::SqlitePool>,
     lnurl: AsyncClient,
     payments: PaymentsByIp,
     auth: AuthState,
+    reorg_config: ReorgConfig,
+}
+
+#[derive(Clone)]
+pub struct ReorgConfig {
+    enabled: bool,
+    cooldown_seconds: u64,
+    pricing: HashMap<u8, u64>,
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         host: String,
         keys: Keys,
         lightning_client: LndLightningClient,
+        mainnet_lightning_client: Option<LndLightningClient>,
+        bitcoin_rpc: Option<Arc<bitcoincore_rpc::Client>>,
+        reorg_db: Option<SqlitePool>,
         network: bitcoin::Network,
         auth: AuthState,
+        reorg_config: ReorgConfig,
     ) -> Self {
         let lnurl = lnurl::Builder::default().build_async().unwrap();
         AppState {
@@ -67,9 +90,13 @@ impl AppState {
             keys,
             network,
             lightning_client,
+            mainnet_lightning_client,
+            bitcoin_rpc,
+            reorg_db,
             lnurl,
             payments: PaymentsByIp::new(),
             auth,
+            reorg_config,
         }
     }
 }
@@ -103,6 +130,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/channel",
             post(channel_handler).route_layer(middleware::from_fn(auth_middleware)),
         )
+        .route(
+            "/api/reorg/invoice",
+            post(reorg_invoice_handler).route_layer(middleware::from_fn(auth_middleware)),
+        )
         .fallback(fallback)
         .layer(Extension(state.clone()))
         .layer(
@@ -113,13 +144,22 @@ async fn main() -> anyhow::Result<()> {
         );
 
     // start dm listener thread
+    let dm_state = state.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(e) = listen_to_nostr_dms(state.clone()).await {
+            if let Err(e) = listen_to_nostr_dms(dm_state.clone()).await {
                 error!("Error listening to nostr dms: {e}");
             }
         }
     });
+
+    // start reorg invoice listener thread
+    if state.reorg_config.enabled {
+        let reorg_state = state.clone();
+        tokio::spawn(async move {
+            start_reorg_invoice_listener(reorg_state).await;
+        });
+    }
 
     // Set up a oneshot channel to handle shutdown signal
     let (tx, rx) = oneshot::channel();
@@ -468,6 +508,16 @@ async fn channel_handler(
     let txid = open_channel(&state, x_forwarded_for, Some(&user), payload).await?;
 
     Ok(Json(ChannelResponse { txid }))
+}
+
+#[axum::debug_handler]
+async fn reorg_invoice_handler(
+    Extension(state): Extension<AppState>,
+    Extension(user): Extension<AuthUser>,
+    Json(payload): Json<ReorgInvoiceRequest>,
+) -> Result<Json<ReorgInvoiceResponse>, AppError> {
+    let response = generate_reorg_invoice(&state, &user, payload).await?;
+    Ok(Json(response))
 }
 
 // Make our own error that wraps `anyhow::Error`.

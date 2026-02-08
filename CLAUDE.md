@@ -131,3 +131,40 @@ All user management files are read fresh on each request (no caching), located i
 - Text files with one entry per line
 - Empty lines and whitespace are ignored
 - Email matching is case-insensitive for banned domains
+
+## Paid Block Reorg Feature
+
+Premium feature allowing authenticated users to trigger block reorganizations by paying with real Lightning payments.
+
+**Architecture:**
+
+- `src/reorg.rs`: Invoice generation and reorg execution
+- Two-step flow: generate mainnet invoice → pay → execute reorg
+- Mainnet LND client for accepting real payments (separate from testnet/regtest faucet LND)
+- Bitcoin Core RPC integration for `invalidate_block` calls
+- Works on both regtest and signet networks
+- Progressive pricing: 10k, 20k, 35k, 50k, 75k sats for 1-5 blocks
+- 1-hour cooldown between reorgs
+
+**Endpoints:**
+
+- `POST /api/reorg/invoice`: Generate mainnet invoice and store pending reorg (requires auth)
+
+**Environment Variables:**
+
+- `MAINNET_GRPC_HOST/PORT/TLS_CERT_PATH/ADMIN_MACAROON_PATH`: Mainnet LND connection
+- `REORG_ENABLED`: Feature flag (must be "true")
+- `REORG_COOLDOWN_SECONDS`: Cooldown duration (default: 3600)
+- `REORG_DB_PATH`: SQLite database path (default: "reorg.db")
+- Existing Bitcoin Core RPC vars: `BITCOIN_RPC_HOST_AND_PORT`, `BITCOIN_RPC_USER`, `BITCOIN_RPC_PASSWORD`
+
+**How it works:**
+
+- User generates invoice via `/api/reorg/invoice`, stored in SQLite database
+- Background task subscribes to mainnet LND invoice updates
+- When invoice is paid, automatically executes reorg
+- Calls `invalidate_block` on Bitcoin Core to invalidate N blocks from the chain tip
+- On regtest: Chain height decreases; new blocks can be mined to rebuild
+- On signet: Chain height decreases; waits for new blocks from the network
+- Cooldown stored in database, persists across restarts
+- On startup, checks all pending reorgs and executes if already paid
