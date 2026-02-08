@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 
-use bitcoincore_rpc::{Auth, RpcApi};
+use bitcoincore_rpc::Auth;
 use log::{info, warn};
 use nostr::key::Keys;
 use tonic_openssl_lnd::lnrpc;
@@ -176,26 +176,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
                     bitcoincore_rpc::Client::new(&full_url, Auth::UserPass(user, password))
                         .expect("Failed to create Bitcoin Core RPC client");
 
-                // Verify connection and check it's regtest or signet
-                let blockchain_info = rpc_client
-                    .get_blockchain_info()
-                    .expect("Failed to get blockchain info");
-
-                let is_valid_network = blockchain_info.chain
-                    == bitcoincore_rpc::bitcoin::Network::Regtest
-                    || blockchain_info.chain == bitcoincore_rpc::bitcoin::Network::Signet;
-
-                if !is_valid_network {
-                    panic!(
-                        "Bitcoin Core is not on regtest or signet! Found chain: {:?}",
-                        blockchain_info.chain
-                    );
-                }
-
-                info!(
-                    "Successfully connected to Bitcoin Core ({:?})",
-                    blockchain_info.chain
-                );
+                info!("Successfully connected to Bitcoin Core",);
                 Some(Arc::new(rpc_client))
             }
             _ => {

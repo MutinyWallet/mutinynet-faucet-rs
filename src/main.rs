@@ -57,7 +57,7 @@ pub struct AppState {
     lightning_client: LndLightningClient,
     mainnet_lightning_client: Option<LndLightningClient>,
     bitcoin_rpc: Option<Arc<bitcoincore_rpc::Client>>,
-    reorg_db: Option<sqlx::SqlitePool>,
+    reorg_db: Option<SqlitePool>,
     lnurl: AsyncClient,
     payments: PaymentsByIp,
     auth: AuthState,
