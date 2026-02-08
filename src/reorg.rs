@@ -37,6 +37,11 @@ pub async fn init_reorg_db(db_path: &str) -> Result<SqlitePool> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // Create database file if it doesn't exist
+    if !std::path::Path::new(db_path).exists() {
+        std::fs::File::create(db_path)?;
+    }
+
     let pool = SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
 
     // Run schema
