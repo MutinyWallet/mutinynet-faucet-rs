@@ -32,9 +32,9 @@ use crate::nostr_dms::listen_to_nostr_dms;
 use crate::payments::PaymentsByIp;
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
 use channel::{open_channel, ChannelRequest, ChannelResponse};
+use l402::{generate_l402_token, L402Config};
 use lightning::{pay_lightning, LightningRequest, LightningResponse};
 use onchain::{pay_onchain, OnchainRequest, OnchainResponse};
-use l402::{generate_l402_token, L402Config};
 use reorg::{
     generate_reorg_invoice, start_reorg_invoice_listener, ReorgInvoiceRequest, ReorgInvoiceResponse,
 };
@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/lnurlw/callback", get(lnurlw_callback_handler))
         .route("/api/bolt11", post(bolt11_handler))
         .route("/api/l402", post(l402_handler))
+        .route("/api/l402", get(l402_handler))
         .route(
             "/api/channel",
             post(channel_handler).route_layer(middleware::from_fn(auth_middleware)),
