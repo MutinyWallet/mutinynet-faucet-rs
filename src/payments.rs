@@ -72,7 +72,7 @@ impl PaymentsByIp {
             self.add_payment_impl(&address.to_string(), amount).await;
         }
         if let Some(user) = user {
-            self.add_payment_impl(format!("github:{}", user.username).as_str(), amount)
+            self.add_payment_impl(format!("user:{}", user.username).as_str(), amount)
                 .await;
         }
     }
@@ -115,7 +115,7 @@ impl PaymentsByIp {
             }
         };
         if let Some(user) = user {
-            if let Some(tracker) = trackers.get_mut(format!("github:{}", user.username).as_str()) {
+            if let Some(tracker) = trackers.get_mut(format!("user:{}", user.username).as_str()) {
                 user_amt += tracker.sum_payments();
             }
         }

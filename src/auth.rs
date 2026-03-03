@@ -1,10 +1,9 @@
+use crate::l402::{validate_l402_credentials, L402Error};
 use crate::AppState;
-use axum::headers::authorization::Bearer;
-use axum::headers::Authorization;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::{Json, TypedHeader};
+use axum::Json;
 use jsonwebtoken::{decode, DecodingKey, Validation};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -144,43 +143,72 @@ pub struct AuthUser {
     pub username: String,
 }
 
-// Middleware for JWT verification
+// Middleware for JWT and L402 verification
 pub async fn auth_middleware<B>(
-    TypedHeader(auth): TypedHeader<Authorization<Bearer>>,
+    headers: HeaderMap,
     mut request: Request<B>,
     next: Next<B>,
 ) -> Result<Response, AuthError> {
     let state = request
         .extensions()
         .get::<AppState>()
-        .expect("JWT config not found in extensions");
+        .expect("AppState not found in extensions");
 
-    if auth.token().is_empty() {
-        return Err(AuthError::MissingToken);
-    }
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(AuthError::MissingToken)?;
 
-    // Verify and decode the token
-    let token_data = decode::<TokenClaims>(
-        auth.token(),
-        &DecodingKey::from_secret(state.auth.jwt_secret.as_bytes()),
-        &Validation::default(),
-    )
-    .map_err(|_| AuthError::InvalidToken)?;
+    let auth_user = if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        // GitHub OAuth JWT path
+        if token.is_empty() {
+            return Err(AuthError::MissingToken);
+        }
 
-    // Check if token is expired
-    let now = chrono::Utc::now().timestamp() as usize;
-    if token_data.claims.exp < now {
-        return Err(AuthError::TokenExpired);
-    }
+        let token_data = decode::<TokenClaims>(
+            token,
+            &DecodingKey::from_secret(state.auth.jwt_secret.as_bytes()),
+            &Validation::default(),
+        )
+        .map_err(|_| AuthError::InvalidToken)?;
 
-    if is_banned(&token_data.claims.sub) {
-        return Err(AuthError::TokenExpired);
-    }
+        let now = chrono::Utc::now().timestamp() as usize;
+        if token_data.claims.exp < now {
+            return Err(AuthError::TokenExpired);
+        }
 
-    // Add AuthUser to request extensions
-    request.extensions_mut().insert(AuthUser {
-        username: token_data.claims.sub,
-    });
+        if is_banned(&token_data.claims.sub) {
+            return Err(AuthError::TokenExpired);
+        }
 
+        AuthUser {
+            username: token_data.claims.sub,
+        }
+    } else if let Some(credentials) = auth_header.strip_prefix("L402 ") {
+        // L402 Lightning payment path
+        let (token, preimage_hex) = credentials
+            .split_once(':')
+            .ok_or(AuthError::InvalidToken)?;
+
+        if token.is_empty() || preimage_hex.is_empty() {
+            return Err(AuthError::MissingToken);
+        }
+
+        let payment_hash =
+            validate_l402_credentials(token, preimage_hex, &state.auth.jwt_secret).map_err(
+                |e| match e {
+                    L402Error::TokenExpired => AuthError::TokenExpired,
+                    _ => AuthError::InvalidToken,
+                },
+            )?;
+
+        AuthUser {
+            username: format!("l402:{}", payment_hash),
+        }
+    } else {
+        return Err(AuthError::InvalidToken);
+    };
+
+    request.extensions_mut().insert(auth_user);
     Ok(next.run(request).await)
 }
