@@ -131,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/lnurlw", get(lnurlw_handler))
         .route("/api/lnurlw/callback", get(lnurlw_callback_handler))
         .route("/api/bolt11", post(bolt11_handler))
-        .route("/api/l402", post(l402_handler))
+        .route("/api/l402", post(l402_handler).get(l402_challenge_handler))
         .route(
             "/api/channel",
             post(channel_handler).route_layer(middleware::from_fn(auth_middleware)),
@@ -485,10 +485,7 @@ struct L402HandlerResponse {
     token: String,
 }
 
-#[axum::debug_handler]
-async fn l402_handler(
-    Extension(state): Extension<AppState>,
-) -> Result<Json<L402HandlerResponse>, AppError> {
+async fn generate_l402_challenge(state: &AppState) -> Result<L402HandlerResponse, AppError> {
     if !state.l402_config.enabled {
         return Err(AppError::new("L402 authentication is not enabled"));
     }
@@ -505,10 +502,42 @@ async fn l402_handler(
     )
     .await?;
 
-    Ok(Json(L402HandlerResponse {
+    Ok(L402HandlerResponse {
         invoice: response.invoice,
         token: response.token,
-    }))
+    })
+}
+
+/// GET /api/l402 — returns 402 Payment Required with WWW-Authenticate header
+/// for spec-compliant L402 discovery (e.g. 402index.io)
+#[axum::debug_handler]
+async fn l402_challenge_handler(
+    Extension(state): Extension<AppState>,
+) -> Result<Response, AppError> {
+    let challenge = generate_l402_challenge(&state).await?;
+
+    let www_auth = format!(
+        "L402 token=\"{}\", invoice=\"{}\"",
+        challenge.token, challenge.invoice
+    );
+
+    Ok((
+        StatusCode::PAYMENT_REQUIRED,
+        [(axum::http::header::WWW_AUTHENTICATE, www_auth)],
+        Json(json!({
+            "invoice": challenge.invoice,
+            "token": challenge.token,
+        })),
+    )
+        .into_response())
+}
+
+#[axum::debug_handler]
+async fn l402_handler(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<L402HandlerResponse>, AppError> {
+    let challenge = generate_l402_challenge(&state).await?;
+    Ok(Json(challenge))
 }
 
 #[axum::debug_handler]
