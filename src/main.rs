@@ -34,6 +34,7 @@ use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
 use channel::{open_channel, ChannelRequest, ChannelResponse};
 use lightning::{pay_lightning, LightningRequest, LightningResponse};
 use onchain::{pay_onchain, OnchainRequest, OnchainResponse};
+use l402::{generate_l402_token, L402Config};
 use reorg::{
     generate_reorg_invoice, start_reorg_invoice_listener, ReorgInvoiceRequest, ReorgInvoiceResponse,
 };
@@ -42,6 +43,7 @@ use setup::setup;
 mod auth;
 mod bolt11;
 mod channel;
+mod l402;
 mod lightning;
 mod nostr_dms;
 mod onchain;
@@ -62,6 +64,7 @@ pub struct AppState {
     payments: PaymentsByIp,
     auth: AuthState,
     reorg_config: ReorgConfig,
+    l402_config: L402Config,
 }
 
 #[derive(Clone)]
@@ -83,6 +86,7 @@ impl AppState {
         network: bitcoin::Network,
         auth: AuthState,
         reorg_config: ReorgConfig,
+        l402_config: L402Config,
     ) -> Self {
         let lnurl = lnurl::Builder::default().build_async().unwrap();
         AppState {
@@ -97,6 +101,7 @@ impl AppState {
             payments: PaymentsByIp::new(),
             auth,
             reorg_config,
+            l402_config,
         }
     }
 }
@@ -126,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/lnurlw", get(lnurlw_handler))
         .route("/api/lnurlw/callback", get(lnurlw_callback_handler))
         .route("/api/bolt11", post(bolt11_handler))
+        .route("/api/l402", post(l402_handler))
         .route(
             "/api/channel",
             post(channel_handler).route_layer(middleware::from_fn(auth_middleware)),
@@ -471,6 +477,38 @@ async fn lnurlw_callback_handler(
     } else {
         Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})))
     }
+}
+
+#[derive(Serialize)]
+struct L402HandlerResponse {
+    invoice: String,
+    token: String,
+}
+
+#[axum::debug_handler]
+async fn l402_handler(
+    Extension(state): Extension<AppState>,
+) -> Result<Json<L402HandlerResponse>, AppError> {
+    if !state.l402_config.enabled {
+        return Err(AppError::new("L402 authentication is not enabled"));
+    }
+
+    let mainnet_client = state
+        .mainnet_lightning_client
+        .as_ref()
+        .ok_or_else(|| AppError::new("Mainnet LND not configured"))?;
+
+    let response = generate_l402_token(
+        mainnet_client,
+        &state.auth.jwt_secret,
+        state.l402_config.invoice_amount_sats,
+    )
+    .await?;
+
+    Ok(Json(L402HandlerResponse {
+        invoice: response.invoice,
+        token: response.token,
+    }))
 }
 
 #[axum::debug_handler]

@@ -8,6 +8,7 @@ use nostr::key::Keys;
 use tonic_openssl_lnd::lnrpc;
 
 use crate::auth::AuthState;
+use crate::l402::L402Config;
 use crate::reorg::init_reorg_db;
 use crate::{AppState, ReorgConfig};
 
@@ -96,8 +97,18 @@ pub async fn setup() -> anyhow::Result<AppState> {
         .unwrap_or_else(|_| "3600".to_string())
         .parse::<u64>()?;
 
-    // Initialize mainnet LND client if reorg is enabled
-    let mainnet_lightning_client = if reorg_enabled {
+    // Initialize L402 configuration
+    let l402_enabled = env::var("L402_ENABLED")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()?;
+
+    let l402_invoice_amount_sats = env::var("L402_INVOICE_AMOUNT")
+        .unwrap_or_else(|_| "1000".to_string())
+        .parse::<u64>()?;
+
+    // Initialize mainnet LND client if reorg or L402 is enabled
+    let needs_mainnet_lnd = reorg_enabled || l402_enabled;
+    let mainnet_lightning_client = if needs_mainnet_lnd {
         let mainnet_address = env::var("MAINNET_GRPC_HOST").ok();
         let mainnet_macaroon = env::var("MAINNET_ADMIN_MACAROON_PATH").ok();
         let mainnet_cert = env::var("MAINNET_TLS_CERT_PATH").ok();
@@ -148,7 +159,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
                 Some(mainnet_client)
             }
             _ => {
-                warn!("REORG_ENABLED=true but mainnet LND env vars not set. Reorg feature will be disabled.");
+                warn!("Mainnet LND env vars not set. Features requiring mainnet LND will be disabled.");
                 None
             }
         }
@@ -237,6 +248,23 @@ pub async fn setup() -> anyhow::Result<AppState> {
         pricing,
     };
 
+    // Finalize L402 config
+    let l402_final_enabled = l402_enabled && mainnet_lightning_client.is_some();
+
+    if l402_enabled && !l402_final_enabled {
+        warn!("L402 feature requested but mainnet LND not configured. L402 disabled.");
+    } else if l402_final_enabled {
+        info!(
+            "L402 authentication enabled with {} sat invoice amount",
+            l402_invoice_amount_sats
+        );
+    }
+
+    let l402_config = L402Config {
+        enabled: l402_final_enabled,
+        invoice_amount_sats: l402_invoice_amount_sats,
+    };
+
     Ok(AppState::new(
         host,
         keys,
@@ -247,5 +275,6 @@ pub async fn setup() -> anyhow::Result<AppState> {
         network,
         auth,
         reorg_config,
+        l402_config,
     ))
 }
