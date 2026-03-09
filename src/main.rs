@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/lnurlw/callback", get(lnurlw_callback_handler))
         .route("/api/bolt11", post(bolt11_handler))
         .route("/api/l402", post(l402_handler).get(l402_challenge_handler))
+        .route("/api/l402/check", get(l402_check_handler))
         .route(
             "/api/channel",
             post(channel_handler).route_layer(middleware::from_fn(auth_middleware)),
@@ -538,6 +539,66 @@ async fn l402_handler(
 ) -> Result<Json<L402HandlerResponse>, AppError> {
     let challenge = generate_l402_challenge(&state).await?;
     Ok(Json(challenge))
+}
+
+#[derive(Deserialize)]
+struct L402CheckParams {
+    token: String,
+}
+
+#[axum::debug_handler]
+async fn l402_check_handler(
+    Extension(state): Extension<AppState>,
+    Query(params): Query<L402CheckParams>,
+) -> Result<Json<Value>, AppError> {
+    if !state.l402_config.enabled {
+        return Err(AppError::new("L402 authentication is not enabled"));
+    }
+
+    let mainnet_client = state
+        .mainnet_lightning_client
+        .as_ref()
+        .ok_or_else(|| AppError::new("Mainnet LND not configured"))?;
+
+    // Decode the JWT to get the payment_hash
+    let token_data = jsonwebtoken::decode::<l402::L402Claims>(
+        &params.token,
+        &jsonwebtoken::DecodingKey::from_secret(state.auth.jwt_secret.as_bytes()),
+        &jsonwebtoken::Validation::default(),
+    )
+    .map_err(|_| AppError::new("Invalid token"))?;
+
+    let payment_hash_hex = &token_data.claims.payment_hash;
+    let payment_hash_bytes = hex::decode(payment_hash_hex)
+        .map_err(|_| AppError::new("Invalid payment hash"))?;
+
+    let lookup_request = tonic_openssl_lnd::lnrpc::PaymentHash {
+        r_hash: payment_hash_bytes,
+        ..Default::default()
+    };
+
+    let invoice = mainnet_client
+        .clone()
+        .lookup_invoice(lookup_request)
+        .await
+        .map_err(|_| AppError::new("Failed to lookup invoice"))?
+        .into_inner();
+
+    if invoice.state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Settled as i32 {
+        let preimage_hex = hex::encode(&invoice.r_preimage);
+        Ok(Json(json!({
+            "status": "settled",
+            "preimage": preimage_hex,
+        })))
+    } else if invoice.state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Canceled as i32 {
+        Ok(Json(json!({
+            "status": "expired",
+        })))
+    } else {
+        Ok(Json(json!({
+            "status": "pending",
+        })))
+    }
 }
 
 #[axum::debug_handler]
