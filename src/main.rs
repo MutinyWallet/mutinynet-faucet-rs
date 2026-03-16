@@ -113,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let state = setup().await?;
 
     let app: Router = Router::new()
+        .route("/auth/github/client_id", get(github_client_id))
         .route("/auth/github", get(github_auth))
         .route("/auth/github/callback", get(github_callback))
         .route("/auth/github/device", post(github_device))
@@ -211,6 +212,11 @@ async fn main() -> anyhow::Result<()> {
     println!("Graceful shutdown complete");
 
     Ok(())
+}
+
+#[axum::debug_handler]
+async fn github_client_id(Extension(state): Extension<AppState>) -> Json<Value> {
+    Json(json!({ "client_id": state.auth.github_client_id }))
 }
 
 #[axum::debug_handler]
