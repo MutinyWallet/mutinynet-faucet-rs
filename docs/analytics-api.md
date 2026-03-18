@@ -45,6 +45,46 @@ All endpoints (except `/recent`) accept:
 
 ## Endpoints
 
+### `GET /api/analytics` (combined)
+
+Returns all analytics data in a single request. Use this for initial dashboard load to avoid multiple round trips. All queries and LND balance calls run concurrently.
+
+**Params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `hours` | integer | `24` | Rolling window to look back |
+| `interval` | string | `hour` | Bucket size for timeseries: `hour` or `day` |
+| `recent_limit` | integer | `50` | Max recent payments |
+| `users_limit` | integer | `50` | Max top users |
+| `domains_limit` | integer | `50` | Max domains |
+
+**Response:** contains all sections: `summary`, `timeseries`, `recent`, `users`, `domains`, `l402`, and `balance`.
+
+```json
+{
+  "hours": 24,
+  "interval": "hour",
+  "summary": { "total_count": 142, "total_sats": 84200000, "unique_users": 37, "avg_sats": 593000, "by_type": [...] },
+  "timeseries": [{ "time": "...", "count": 5, "total_sats": 2500000, "by_type": [...] }, ...],
+  "recent": [{ "id": 1042, "created_at": 1710700123, "payment_type": "onchain", "amount_sats": 500000, "user": "...", "destination": "..." }, ...],
+  "users": [{ "user": "alice@example.com", "count": 12, "total_sats": 8400000, "last_payment": 1710700000 }, ...],
+  "domains": [{ "domain": "gmail.com", "count": 80, "total_sats": 50000000, "unique_users": 25 }, ...],
+  "l402": {
+    "issued": { "count": 45, "total_sats": 45000, "timeseries": [...] },
+    "paid": { "count": 30, "total_sats": 30000, "timeseries": [...] }
+  },
+  "balance": {
+    "onchain": { "total_sats": 50000000, "confirmed_sats": 49500000, "unconfirmed_sats": 500000 },
+    "lightning": { "local_balance_sats": 30000000, "remote_balance_sats": 15000000, "pending_open_local_sats": 0, "pending_open_remote_sats": 0 }
+  }
+}
+```
+
+---
+
+The individual endpoints below are still available for targeted queries:
+
 ### `GET /api/analytics/summary`
 
 High-level KPIs for the time window. Use for dashboard header cards.

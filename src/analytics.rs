@@ -815,6 +815,311 @@ pub async fn analytics_balance(
     })))
 }
 
+// -- Combined --
+
+#[derive(Deserialize)]
+pub struct CombinedParams {
+    pub hours: Option<i64>,
+    pub interval: Option<String>,
+    pub recent_limit: Option<i64>,
+    pub users_limit: Option<i64>,
+    pub domains_limit: Option<i64>,
+}
+
+pub async fn analytics_combined(
+    Extension(state): Extension<crate::AppState>,
+    Query(params): Query<CombinedParams>,
+) -> Result<Json<Value>, AppError> {
+    let pool = get_pool(&state)?;
+
+    let hours = params.hours.unwrap_or(24);
+    let cutoff = chrono::Utc::now().timestamp() - (hours * 3600);
+    let interval = params.interval.as_deref().unwrap_or("hour");
+    let recent_limit = params.recent_limit.unwrap_or(50);
+    let users_limit = params.users_limit.unwrap_or(50);
+    let domains_limit = params.domains_limit.unwrap_or(50);
+
+    let format_str = match interval {
+        "day" => "%Y-%m-%d",
+        _ => "%Y-%m-%dT%H:00:00Z",
+    };
+
+    // Run all queries and LND calls concurrently
+    let (
+        summary_rows,
+        unique_row,
+        timeseries_rows,
+        recent_rows,
+        users_rows,
+        domains_rows,
+        l402_summary,
+        l402_issued_rows,
+        l402_paid_rows,
+        balance,
+    ) = tokio::join!(
+        // Summary by type
+        sqlx::query(
+            r#"SELECT payment_type, COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats
+               FROM faucet_payments WHERE created_at > $1
+               GROUP BY payment_type ORDER BY total_sats DESC"#,
+        )
+        .bind(cutoff)
+        .fetch_all(pool),
+        // Unique users
+        sqlx::query(
+            r#"SELECT COUNT(DISTINCT COALESCE(username, ip_address)) as unique_users
+               FROM faucet_payments WHERE created_at > $1"#,
+        )
+        .bind(cutoff)
+        .fetch_one(pool),
+        // Timeseries with per-type breakdown
+        sqlx::query(
+            r#"SELECT strftime($1, created_at, 'unixepoch') as bucket, payment_type,
+               COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats
+               FROM faucet_payments WHERE created_at > $2
+               GROUP BY bucket, payment_type ORDER BY bucket ASC"#,
+        )
+        .bind(format_str)
+        .bind(cutoff)
+        .fetch_all(pool),
+        // Recent
+        sqlx::query(
+            r#"SELECT id, created_at, payment_type, amount_sats,
+                      COALESCE(username, ip_address) as user_id, destination
+               FROM faucet_payments ORDER BY created_at DESC LIMIT $1"#,
+        )
+        .bind(recent_limit)
+        .fetch_all(pool),
+        // Top users
+        sqlx::query(
+            r#"SELECT COALESCE(username, ip_address) as user_id,
+                      COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats,
+                      MAX(created_at) as last_payment
+               FROM faucet_payments WHERE created_at > $1
+               GROUP BY user_id ORDER BY total_sats DESC LIMIT $2"#,
+        )
+        .bind(cutoff)
+        .bind(users_limit)
+        .fetch_all(pool),
+        // Domains
+        sqlx::query(
+            r#"SELECT LOWER(SUBSTR(username, INSTR(username, '@') + 1)) as domain,
+                      COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats,
+                      COUNT(DISTINCT username) as unique_users
+               FROM faucet_payments
+               WHERE created_at > $1 AND username IS NOT NULL AND username LIKE '%@%'
+               GROUP BY domain ORDER BY total_sats DESC LIMIT $2"#,
+        )
+        .bind(cutoff)
+        .bind(domains_limit)
+        .fetch_all(pool),
+        // L402 summary
+        sqlx::query(
+            r#"SELECT COUNT(*) as issued_count,
+                      COALESCE(SUM(amount_sats), 0) as issued_sats,
+                      COALESCE(SUM(CASE WHEN paid = 1 THEN 1 ELSE 0 END), 0) as paid_count,
+                      COALESCE(SUM(CASE WHEN paid = 1 THEN amount_sats ELSE 0 END), 0) as paid_sats
+               FROM l402_invoices WHERE created_at > $1"#,
+        )
+        .bind(cutoff)
+        .fetch_one(pool),
+        // L402 issued timeseries
+        sqlx::query(
+            r#"SELECT strftime($1, created_at, 'unixepoch') as bucket,
+                      COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats
+               FROM l402_invoices WHERE created_at > $2
+               GROUP BY bucket ORDER BY bucket ASC"#,
+        )
+        .bind(format_str)
+        .bind(cutoff)
+        .fetch_all(pool),
+        // L402 paid timeseries
+        sqlx::query(
+            r#"SELECT strftime($1, paid_at, 'unixepoch') as bucket,
+                      COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats
+               FROM l402_invoices WHERE paid = 1 AND paid_at > $2
+               GROUP BY bucket ORDER BY bucket ASC"#,
+        )
+        .bind(format_str)
+        .bind(cutoff)
+        .fetch_all(pool),
+        // LND balance
+        async {
+            let mut client = state.lightning_client.clone();
+            let w = client
+                .wallet_balance(tonic_openssl_lnd::lnrpc::WalletBalanceRequest {})
+                .await;
+            let c = client
+                .channel_balance(tonic_openssl_lnd::lnrpc::ChannelBalanceRequest {})
+                .await;
+            (w, c)
+        },
+    );
+
+    // -- Build summary --
+    let summary_rows = summary_rows?;
+    let unique_row = unique_row?;
+    let by_type: Vec<Value> = summary_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "payment_type": row.get::<String, _>("payment_type"),
+                "count": row.get::<i64, _>("count"),
+                "total_sats": row.get::<i64, _>("total_sats"),
+            })
+        })
+        .collect();
+    let total_count: i64 = summary_rows.iter().map(|r| r.get::<i64, _>("count")).sum();
+    let total_sats: i64 = summary_rows
+        .iter()
+        .map(|r| r.get::<i64, _>("total_sats"))
+        .sum();
+    let unique_users: i64 = unique_row.get("unique_users");
+    let avg_sats = if total_count > 0 {
+        total_sats / total_count
+    } else {
+        0
+    };
+
+    // -- Build timeseries --
+    let timeseries_rows = timeseries_rows?;
+    let mut bucket_map: HashMap<String, BucketData> = HashMap::new();
+    let mut bucket_order: Vec<String> = Vec::new();
+    for row in &timeseries_rows {
+        let bucket: String = row.get("bucket");
+        let payment_type: String = row.get("payment_type");
+        let count: i64 = row.get("count");
+        let ts: i64 = row.get("total_sats");
+        let entry = bucket_map.entry(bucket.clone()).or_insert_with(|| {
+            bucket_order.push(bucket.clone());
+            BucketData::default()
+        });
+        entry.count += count;
+        entry.total_sats += ts;
+        entry.by_type.push(json!({
+            "payment_type": payment_type,
+            "count": count,
+            "total_sats": ts,
+        }));
+    }
+    let buckets: Vec<Value> = bucket_order
+        .iter()
+        .map(|time| {
+            let data = &bucket_map[time];
+            json!({ "time": time, "count": data.count, "total_sats": data.total_sats, "by_type": data.by_type })
+        })
+        .collect();
+
+    // -- Build recent --
+    let recent_rows = recent_rows?;
+    let recent: Vec<Value> = recent_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<i64, _>("id"),
+                "created_at": row.get::<i64, _>("created_at"),
+                "payment_type": row.get::<String, _>("payment_type"),
+                "amount_sats": row.get::<i64, _>("amount_sats"),
+                "user": row.get::<String, _>("user_id"),
+                "destination": row.get::<Option<String>, _>("destination"),
+            })
+        })
+        .collect();
+
+    // -- Build users --
+    let users_rows = users_rows?;
+    let users: Vec<Value> = users_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "user": row.get::<String, _>("user_id"),
+                "count": row.get::<i64, _>("count"),
+                "total_sats": row.get::<i64, _>("total_sats"),
+                "last_payment": row.get::<i64, _>("last_payment"),
+            })
+        })
+        .collect();
+
+    // -- Build domains --
+    let domains_rows = domains_rows?;
+    let domains: Vec<Value> = domains_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "domain": row.get::<String, _>("domain"),
+                "count": row.get::<i64, _>("count"),
+                "total_sats": row.get::<i64, _>("total_sats"),
+                "unique_users": row.get::<i64, _>("unique_users"),
+            })
+        })
+        .collect();
+
+    // -- Build L402 --
+    let l402_summary = l402_summary?;
+    let l402_issued_rows = l402_issued_rows?;
+    let l402_paid_rows = l402_paid_rows?;
+    let l402_issued_ts: Vec<Value> = l402_issued_rows
+        .iter()
+        .map(|r| json!({"time": r.get::<String,_>("bucket"), "count": r.get::<i64,_>("count"), "total_sats": r.get::<i64,_>("total_sats")}))
+        .collect();
+    let l402_paid_ts: Vec<Value> = l402_paid_rows
+        .iter()
+        .map(|r| json!({"time": r.get::<String,_>("bucket"), "count": r.get::<i64,_>("count"), "total_sats": r.get::<i64,_>("total_sats")}))
+        .collect();
+
+    // -- Build balance --
+    let (wallet_res, channel_res) = balance;
+    let balance_val = match (wallet_res, channel_res) {
+        (Ok(w), Ok(c)) => {
+            let w = w.into_inner();
+            let c = c.into_inner();
+            json!({
+                "onchain": {
+                    "total_sats": w.total_balance,
+                    "confirmed_sats": w.confirmed_balance,
+                    "unconfirmed_sats": w.unconfirmed_balance,
+                },
+                "lightning": {
+                    "local_balance_sats": c.local_balance.as_ref().map(|b| b.sat).unwrap_or(0),
+                    "remote_balance_sats": c.remote_balance.as_ref().map(|b| b.sat).unwrap_or(0),
+                    "pending_open_local_sats": c.pending_open_local_balance.as_ref().map(|b| b.sat).unwrap_or(0),
+                    "pending_open_remote_sats": c.pending_open_remote_balance.as_ref().map(|b| b.sat).unwrap_or(0),
+                },
+            })
+        }
+        _ => json!(null),
+    };
+
+    Ok(Json(json!({
+        "hours": hours,
+        "interval": interval,
+        "summary": {
+            "total_count": total_count,
+            "total_sats": total_sats,
+            "unique_users": unique_users,
+            "avg_sats": avg_sats,
+            "by_type": by_type,
+        },
+        "timeseries": buckets,
+        "recent": recent,
+        "users": users,
+        "domains": domains,
+        "l402": {
+            "issued": {
+                "count": l402_summary.get::<i64, _>("issued_count"),
+                "total_sats": l402_summary.get::<i64, _>("issued_sats"),
+                "timeseries": l402_issued_ts,
+            },
+            "paid": {
+                "count": l402_summary.get::<i64, _>("paid_count"),
+                "total_sats": l402_summary.get::<i64, _>("paid_sats"),
+                "timeseries": l402_paid_ts,
+            },
+        },
+        "balance": balance_val,
+    })))
+}
+
 /// Returns a SQL fragment like `AND payment_type = $N` and the value to bind,
 /// or empty string + None if no filter is requested.
 fn type_filter_clause(payment_type: &Option<String>, param_index: u8) -> (String, Option<String>) {

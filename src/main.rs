@@ -29,8 +29,8 @@ use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{AllowMethods, Any, CorsLayer};
 
 use crate::analytics::{
-    analytics_balance, analytics_domains, analytics_l402, analytics_recent, analytics_summary,
-    analytics_timeseries, analytics_users,
+    analytics_balance, analytics_combined, analytics_domains, analytics_l402, analytics_recent,
+    analytics_summary, analytics_timeseries, analytics_users,
 };
 use crate::auth::{auth_middleware, is_premium, AuthState, AuthUser, GithubCallback};
 use crate::nostr_dms::listen_to_nostr_dms;
@@ -187,6 +187,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/analytics/balance",
             get(analytics_balance).route_layer(middleware::from_fn(analytics_auth_middleware)),
+        )
+        .route(
+            "/api/analytics",
+            get(analytics_combined).route_layer(middleware::from_fn(analytics_auth_middleware)),
         )
         .fallback(fallback)
         .layer(Extension(state.clone()))
