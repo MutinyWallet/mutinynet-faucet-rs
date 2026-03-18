@@ -129,7 +129,7 @@ pub fn is_banned(email: &String) -> bool {
         return false;
     }
     let domains = banned_domains();
-    let user_host = email.split('@').last().unwrap_or("");
+    let user_host = email.split('@').next_back().unwrap_or("");
     if domains.contains(&user_host.to_lowercase()) {
         return true;
     }
