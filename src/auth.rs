@@ -198,6 +198,15 @@ pub async fn auth_middleware<B>(
             _ => AuthError::InvalidToken,
         })?;
 
+        if let Some(pool) = &state.analytics_db {
+            crate::analytics::record_payment_once(
+                pool,
+                "l402_paid",
+                state.l402_config.invoice_amount_sats,
+                &payment_hash,
+            );
+        }
+
         AuthUser {
             username: format!("l402:{}", payment_hash),
         }

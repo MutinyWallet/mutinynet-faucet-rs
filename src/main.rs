@@ -644,14 +644,6 @@ async fn l402_check_handler(
         .into_inner();
 
     if invoice.state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Settled as i32 {
-        if let Some(pool) = &state.analytics_db {
-            analytics::record_payment_once(
-                pool,
-                "l402_paid",
-                invoice.value as u64,
-                payment_hash_hex,
-            );
-        }
         let preimage_hex = hex::encode(&invoice.r_preimage);
         Ok(Json(json!({
             "status": "settled",
