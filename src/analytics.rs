@@ -493,6 +493,78 @@ pub async fn analytics_recent(
     })))
 }
 
+// -- Domains --
+
+#[derive(Deserialize)]
+pub struct DomainsParams {
+    /// Number of hours to look back (default: 24)
+    pub hours: Option<i64>,
+    /// Max domains to return (default: 50)
+    pub limit: Option<i64>,
+    /// Filter to a specific payment type
+    pub payment_type: Option<String>,
+}
+
+pub async fn analytics_domains(
+    Extension(state): Extension<crate::AppState>,
+    Query(params): Query<DomainsParams>,
+) -> Result<Json<Value>, AppError> {
+    let pool = get_pool(&state)?;
+
+    let hours = params.hours.unwrap_or(24);
+    let limit = params.limit.unwrap_or(50);
+    let cutoff = chrono::Utc::now().timestamp() - (hours * 3600);
+
+    let (type_filter, bind_type) = type_filter_clause(&params.payment_type, 3);
+
+    // Extract domain from email usernames (everything after @)
+    // Exclude non-email usernames (l402:*, IPs, nostr pubkeys)
+    let query_str = format!(
+        r#"
+        SELECT LOWER(SUBSTR(username, INSTR(username, '@') + 1)) as domain,
+               COUNT(*) as count,
+               COALESCE(SUM(amount_sats), 0) as total_sats,
+               COUNT(DISTINCT username) as unique_users
+        FROM faucet_payments
+        WHERE created_at > $1
+          AND username IS NOT NULL
+          AND username LIKE '%@%'
+          {type_filter}
+        GROUP BY domain
+        ORDER BY total_sats DESC
+        LIMIT $2
+        "#,
+    );
+
+    let mut q = sqlx::query(&query_str).bind(cutoff);
+    if let Some(ref t) = bind_type {
+        q = q.bind(t);
+    }
+    let rows = q.bind(limit).fetch_all(pool).await?;
+
+    let domains: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "domain": row.get::<String, _>("domain"),
+                "count": row.get::<i64, _>("count"),
+                "total_sats": row.get::<i64, _>("total_sats"),
+                "unique_users": row.get::<i64, _>("unique_users"),
+            })
+        })
+        .collect();
+
+    let total_count: i64 = rows.iter().map(|r| r.get::<i64, _>("count")).sum();
+    let total_sats: i64 = rows.iter().map(|r| r.get::<i64, _>("total_sats")).sum();
+
+    Ok(Json(json!({
+        "hours": hours,
+        "total_count": total_count,
+        "total_sats": total_sats,
+        "domains": domains,
+    })))
+}
+
 /// Returns a SQL fragment like `AND payment_type = $N` and the value to bind,
 /// or empty string + None if no filter is requested.
 fn type_filter_clause(payment_type: &Option<String>, param_index: u8) -> (String, Option<String>) {

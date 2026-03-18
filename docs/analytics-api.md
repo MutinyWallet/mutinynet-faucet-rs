@@ -193,6 +193,34 @@ Note: this endpoint does **not** accept `hours` — it always returns the N most
 }
 ```
 
+### `GET /api/analytics/domains`
+
+Usage breakdown by email domain (gmail.com, hotmail.com, proton.me, etc.). Only includes authenticated users with email usernames — excludes L402 users, IPs, and Nostr pubkeys.
+
+**Extra params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | integer | `50` | Max number of domains to return |
+
+**Response:**
+
+```json
+{
+  "hours": 24,
+  "total_count": 120,
+  "total_sats": 72000000,
+  "domains": [
+    { "domain": "gmail.com", "count": 80, "total_sats": 50000000, "unique_users": 25 },
+    { "domain": "proton.me", "count": 20, "total_sats": 12000000, "unique_users": 8 },
+    { "domain": "hotmail.com", "count": 12, "total_sats": 6000000, "unique_users": 3 },
+    { "domain": "example.com", "count": 8, "total_sats": 4000000, "unique_users": 1 }
+  ]
+}
+```
+
+---
+
 ## Database Schema
 
 ```sql
