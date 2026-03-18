@@ -783,6 +783,38 @@ pub async fn analytics_l402(
     })))
 }
 
+// -- Balance --
+
+pub async fn analytics_balance(
+    Extension(state): Extension<crate::AppState>,
+) -> Result<Json<Value>, AppError> {
+    let mut client = state.lightning_client.clone();
+
+    let wallet = client
+        .wallet_balance(tonic_openssl_lnd::lnrpc::WalletBalanceRequest {})
+        .await?
+        .into_inner();
+
+    let channels = client
+        .channel_balance(tonic_openssl_lnd::lnrpc::ChannelBalanceRequest {})
+        .await?
+        .into_inner();
+
+    Ok(Json(json!({
+        "onchain": {
+            "total_sats": wallet.total_balance,
+            "confirmed_sats": wallet.confirmed_balance,
+            "unconfirmed_sats": wallet.unconfirmed_balance,
+        },
+        "lightning": {
+            "local_balance_sats": channels.local_balance.as_ref().map(|b| b.sat).unwrap_or(0),
+            "remote_balance_sats": channels.remote_balance.as_ref().map(|b| b.sat).unwrap_or(0),
+            "pending_open_local_sats": channels.pending_open_local_balance.as_ref().map(|b| b.sat).unwrap_or(0),
+            "pending_open_remote_sats": channels.pending_open_remote_balance.as_ref().map(|b| b.sat).unwrap_or(0),
+        },
+    })))
+}
+
 /// Returns a SQL fragment like `AND payment_type = $N` and the value to bind,
 /// or empty string + None if no filter is requested.
 fn type_filter_clause(payment_type: &Option<String>, param_index: u8) -> (String, Option<String>) {

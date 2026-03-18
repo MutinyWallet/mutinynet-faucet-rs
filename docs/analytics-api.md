@@ -275,6 +275,34 @@ L402 data is stored in a separate `l402_invoices` table (not mixed with faucet p
 
 ---
 
+### `GET /api/analytics/balance`
+
+Live wallet balances from LND. No query parameters — returns current state.
+
+**Response:**
+
+```json
+{
+  "onchain": {
+    "total_sats": 50000000,
+    "confirmed_sats": 49500000,
+    "unconfirmed_sats": 500000
+  },
+  "lightning": {
+    "local_balance_sats": 30000000,
+    "remote_balance_sats": 15000000,
+    "pending_open_local_sats": 0,
+    "pending_open_remote_sats": 0
+  }
+}
+```
+
+- `onchain.total_sats` — total on-chain wallet balance (confirmed + unconfirmed)
+- `lightning.local_balance_sats` — outbound liquidity (what the faucet can send)
+- `lightning.remote_balance_sats` — inbound liquidity
+
+---
+
 ## Database Schema
 
 ```sql
