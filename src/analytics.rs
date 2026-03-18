@@ -565,6 +565,133 @@ pub async fn analytics_domains(
     })))
 }
 
+// -- L402 --
+
+#[derive(Deserialize)]
+pub struct L402Params {
+    /// Number of hours to look back (default: 24)
+    pub hours: Option<i64>,
+    /// Bucket interval: "hour" or "day" (default: "hour")
+    pub interval: Option<String>,
+}
+
+pub async fn analytics_l402(
+    Extension(state): Extension<crate::AppState>,
+    Query(params): Query<L402Params>,
+) -> Result<Json<Value>, AppError> {
+    let pool = get_pool(&state)?;
+
+    let hours = params.hours.unwrap_or(24);
+    let cutoff = chrono::Utc::now().timestamp() - (hours * 3600);
+    let interval = params.interval.as_deref().unwrap_or("hour");
+
+    let format_str = match interval {
+        "day" => "%Y-%m-%d",
+        _ => "%Y-%m-%dT%H:00:00Z",
+    };
+
+    // Tokens issued (l402_issued events)
+    let issued_summary = sqlx::query(
+        r#"
+        SELECT COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats
+        FROM faucet_payments
+        WHERE created_at > $1 AND payment_type = 'l402_issued'
+        "#,
+    )
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await?;
+
+    // Payments made by L402-authenticated users (username starts with 'l402:')
+    let usage_summary = sqlx::query(
+        r#"
+        SELECT COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats,
+               COUNT(DISTINCT username) as unique_tokens
+        FROM faucet_payments
+        WHERE created_at > $1
+          AND username LIKE 'l402:%'
+          AND payment_type != 'l402_issued'
+        "#,
+    )
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await?;
+
+    // Timeseries for issued tokens
+    let issued_rows = sqlx::query(
+        r#"
+        SELECT strftime($1, created_at, 'unixepoch') as bucket,
+               COUNT(*) as count,
+               COALESCE(SUM(amount_sats), 0) as total_sats
+        FROM faucet_payments
+        WHERE created_at > $2 AND payment_type = 'l402_issued'
+        GROUP BY bucket
+        ORDER BY bucket ASC
+        "#,
+    )
+    .bind(format_str)
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+
+    let issued_buckets: Vec<Value> = issued_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "time": row.get::<String, _>("bucket"),
+                "count": row.get::<i64, _>("count"),
+                "total_sats": row.get::<i64, _>("total_sats"),
+            })
+        })
+        .collect();
+
+    // Timeseries for payments made by L402 users
+    let usage_rows = sqlx::query(
+        r#"
+        SELECT strftime($1, created_at, 'unixepoch') as bucket,
+               COUNT(*) as count,
+               COALESCE(SUM(amount_sats), 0) as total_sats
+        FROM faucet_payments
+        WHERE created_at > $2
+          AND username LIKE 'l402:%'
+          AND payment_type != 'l402_issued'
+        GROUP BY bucket
+        ORDER BY bucket ASC
+        "#,
+    )
+    .bind(format_str)
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+
+    let usage_buckets: Vec<Value> = usage_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "time": row.get::<String, _>("bucket"),
+                "count": row.get::<i64, _>("count"),
+                "total_sats": row.get::<i64, _>("total_sats"),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "hours": hours,
+        "interval": interval,
+        "issued": {
+            "count": issued_summary.get::<i64, _>("count"),
+            "total_sats": issued_summary.get::<i64, _>("total_sats"),
+            "timeseries": issued_buckets,
+        },
+        "usage": {
+            "count": usage_summary.get::<i64, _>("count"),
+            "total_sats": usage_summary.get::<i64, _>("total_sats"),
+            "unique_tokens": usage_summary.get::<i64, _>("unique_tokens"),
+            "timeseries": usage_buckets,
+        },
+    })))
+}
+
 /// Returns a SQL fragment like `AND payment_type = $N` and the value to bind,
 /// or empty string + None if no filter is requested.
 fn type_filter_clause(payment_type: &Option<String>, param_index: u8) -> (String, Option<String>) {

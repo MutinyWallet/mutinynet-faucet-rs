@@ -33,6 +33,7 @@ Every recorded payment has a `payment_type` field. Possible values:
 | `bolt11` | `POST /api/bolt11` | Invoice generation (receive-side testing) |
 | `nostr_dm` | Nostr DM listener | Lightning payment triggered via Nostr DM |
 | `nostr_dm_onchain` | Nostr DM listener | On-chain payment triggered via Nostr DM |
+| `l402_issued` | `POST /api/l402`, `GET /api/l402` | L402 authentication token issued (mainnet invoice created) |
 
 ## Common Query Parameters
 
@@ -218,6 +219,49 @@ Usage breakdown by email domain (gmail.com, hotmail.com, proton.me, etc.). Only 
   ]
 }
 ```
+
+---
+
+### `GET /api/analytics/l402`
+
+L402 authentication stats. Shows tokens issued (mainnet invoices generated) and payments made by L402-authenticated users, each with their own timeseries.
+
+**Extra params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `interval` | string | `hour` | Bucket size: `hour` or `day` |
+
+Note: this endpoint does **not** accept `payment_type` — it's L402-specific.
+
+**Response:**
+
+```json
+{
+  "hours": 24,
+  "interval": "hour",
+  "issued": {
+    "count": 45,
+    "total_sats": 45000,
+    "timeseries": [
+      { "time": "2026-03-16T14:00:00Z", "count": 3, "total_sats": 3000 },
+      { "time": "2026-03-16T15:00:00Z", "count": 5, "total_sats": 5000 }
+    ]
+  },
+  "usage": {
+    "count": 12,
+    "total_sats": 6000000,
+    "unique_tokens": 8,
+    "timeseries": [
+      { "time": "2026-03-16T14:00:00Z", "count": 1, "total_sats": 500000 },
+      { "time": "2026-03-16T15:00:00Z", "count": 3, "total_sats": 1500000 }
+    ]
+  }
+}
+```
+
+- `issued` — L402 tokens created (mainnet invoices). `total_sats` is the invoice amount (revenue).
+- `usage` — faucet payments made by users who authenticated via L402. `unique_tokens` is the number of distinct L402 tokens used.
 
 ---
 

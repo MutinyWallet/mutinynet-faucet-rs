@@ -29,7 +29,8 @@ use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{AllowMethods, Any, CorsLayer};
 
 use crate::analytics::{
-    analytics_domains, analytics_recent, analytics_summary, analytics_timeseries, analytics_users,
+    analytics_domains, analytics_l402, analytics_recent, analytics_summary, analytics_timeseries,
+    analytics_users,
 };
 use crate::auth::{auth_middleware, is_premium, AuthState, AuthUser, GithubCallback};
 use crate::nostr_dms::listen_to_nostr_dms;
@@ -178,6 +179,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/analytics/domains",
             get(analytics_domains).route_layer(middleware::from_fn(analytics_auth_middleware)),
+        )
+        .route(
+            "/api/analytics/l402",
+            get(analytics_l402).route_layer(middleware::from_fn(analytics_auth_middleware)),
         )
         .fallback(fallback)
         .layer(Extension(state.clone()))
@@ -545,6 +550,17 @@ async fn generate_l402_challenge(state: &AppState) -> Result<L402HandlerResponse
         state.l402_config.invoice_amount_sats,
     )
     .await?;
+
+    if let Some(tx) = &state.analytics_writer {
+        analytics::record_payment(
+            tx,
+            "l402_issued",
+            state.l402_config.invoice_amount_sats,
+            None,
+            "n/a",
+            Some(&response.invoice),
+        );
+    }
 
     Ok(L402HandlerResponse {
         invoice: response.invoice,
