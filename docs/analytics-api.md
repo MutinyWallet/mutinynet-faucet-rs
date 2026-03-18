@@ -33,8 +33,6 @@ Every recorded payment has a `payment_type` field. Possible values:
 | `bolt11` | `POST /api/bolt11` | Invoice generation (receive-side testing) |
 | `nostr_dm` | Nostr DM listener | Lightning payment triggered via Nostr DM |
 | `nostr_dm_onchain` | Nostr DM listener | On-chain payment triggered via Nostr DM |
-| `l402_issued` | `POST /api/l402`, `GET /api/l402` | L402 authentication token issued (mainnet invoice created) |
-| `l402_paid` | `GET /api/l402/check` | L402 invoice confirmed paid (deduplicated by payment hash) |
 
 ## Common Query Parameters
 
@@ -269,15 +267,18 @@ Note: this endpoint does **not** accept `payment_type` — it's L402-specific.
 }
 ```
 
-- `issued` — L402 tokens created (mainnet invoices generated).
-- `paid` — L402 invoices actually paid (confirmed settled). Deduplicated by payment hash. Compare `issued` vs `paid` to see conversion rate. `total_sats` is revenue collected.
-- `usage` — faucet payments made by users who authenticated via L402. `unique_tokens` is the number of distinct L402 tokens used.
+L402 data is stored in a separate `l402_invoices` table (not mixed with faucet payments).
+
+- `issued` — L402 invoices created. One row per token.
+- `paid` — subset that were actually paid. `paid` timeseries uses `paid_at` timestamps. Compare `issued` vs `paid` for conversion rate. `total_sats` is revenue collected.
+- `usage` — faucet payments made by users who authenticated via L402 (from `faucet_payments`). `unique_tokens` is distinct L402 tokens used.
 
 ---
 
 ## Database Schema
 
 ```sql
+-- Faucet payment events (dispensing stats)
 CREATE TABLE faucet_payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
@@ -287,6 +288,13 @@ CREATE TABLE faucet_payments (
     ip_address TEXT NOT NULL,
     destination TEXT
 );
-```
 
-Indexes on `created_at`, `username`, and `payment_type`.
+-- L402 invoice lifecycle (revenue tracking, separate from faucet dispensing)
+CREATE TABLE l402_invoices (
+    payment_hash TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    amount_sats INTEGER NOT NULL,
+    paid INTEGER NOT NULL DEFAULT 0,
+    paid_at INTEGER
+);
+```

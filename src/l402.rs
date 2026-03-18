@@ -23,6 +23,7 @@ pub struct L402Claims {
 pub struct L402TokenResponse {
     pub invoice: String,
     pub token: String,
+    pub payment_hash: String,
 }
 
 pub async fn generate_l402_token(
@@ -58,6 +59,7 @@ pub async fn generate_l402_token(
     Ok(L402TokenResponse {
         invoice: response.payment_request,
         token,
+        payment_hash: claims.payment_hash,
     })
 }
 

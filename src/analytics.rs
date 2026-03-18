@@ -59,6 +59,27 @@ pub async fn init_analytics_db(path: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Separate table for L402 invoices — not faucet dispensing
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS l402_invoices (
+            payment_hash TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            amount_sats INTEGER NOT NULL,
+            paid INTEGER NOT NULL DEFAULT 0,
+            paid_at INTEGER
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_l402_invoices_created_at ON l402_invoices (created_at)",
+    )
+    .execute(&pool)
+    .await?;
+
     Ok(pool)
 }
 
@@ -142,43 +163,41 @@ pub fn record_payment(
     });
 }
 
-/// Records a payment only if no existing record with the same payment_type and destination exists.
-/// Used for events that may be triggered multiple times (e.g. polling endpoints).
-pub fn record_payment_once(
-    pool: &SqlitePool,
-    payment_type: &str,
-    amount_sats: u64,
-    destination: &str,
-) {
+/// Records an L402 invoice issuance.
+pub fn record_l402_issued(pool: &SqlitePool, payment_hash: &str, amount_sats: u64) {
     let pool = pool.clone();
-    let payment_type = payment_type.to_string();
-    let destination = destination.to_string();
+    let payment_hash = payment_hash.to_string();
 
     tokio::spawn(async move {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM faucet_payments WHERE payment_type = $1 AND destination = $2)",
-        )
-        .bind(&payment_type)
-        .bind(&destination)
-        .fetch_one(&pool)
-        .await
-        .unwrap_or(true);
-
-        if exists {
-            return;
-        }
-
         let result = sqlx::query(
-            "INSERT INTO faucet_payments (payment_type, amount_sats, username, ip_address, destination) VALUES ($1, $2, NULL, 'n/a', $3)",
+            "INSERT OR IGNORE INTO l402_invoices (payment_hash, amount_sats) VALUES ($1, $2)",
         )
-        .bind(&payment_type)
+        .bind(&payment_hash)
         .bind(amount_sats as i64)
-        .bind(&destination)
         .execute(&pool)
         .await;
 
         if let Err(e) = result {
-            error!("Failed to record analytics payment: {e}");
+            error!("Failed to record L402 issued: {e}");
+        }
+    });
+}
+
+/// Marks an L402 invoice as paid. Idempotent — safe to call on every auth.
+pub fn record_l402_paid(pool: &SqlitePool, payment_hash: &str) {
+    let pool = pool.clone();
+    let payment_hash = payment_hash.to_string();
+
+    tokio::spawn(async move {
+        let result = sqlx::query(
+            "UPDATE l402_invoices SET paid = 1, paid_at = strftime('%s', 'now') WHERE payment_hash = $1 AND paid = 0",
+        )
+        .bind(&payment_hash)
+        .execute(&pool)
+        .await;
+
+        if let Err(e) = result {
+            error!("Failed to record L402 paid: {e}");
         }
     });
 }
@@ -631,53 +650,29 @@ pub async fn analytics_l402(
         _ => "%Y-%m-%dT%H:00:00Z",
     };
 
-    // Tokens issued (l402_issued events)
-    let issued_summary = sqlx::query(
+    // Summary from l402_invoices table
+    let summary = sqlx::query(
         r#"
-        SELECT COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats
-        FROM faucet_payments
-        WHERE created_at > $1 AND payment_type = 'l402_issued'
-        "#,
-    )
-    .bind(cutoff)
-    .fetch_one(pool)
-    .await?;
-
-    // Invoices actually paid (l402_paid events, deduplicated by payment_hash)
-    let paid_summary = sqlx::query(
-        r#"
-        SELECT COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats
-        FROM faucet_payments
-        WHERE created_at > $1 AND payment_type = 'l402_paid'
-        "#,
-    )
-    .bind(cutoff)
-    .fetch_one(pool)
-    .await?;
-
-    // Payments made by L402-authenticated users (username starts with 'l402:')
-    let usage_summary = sqlx::query(
-        r#"
-        SELECT COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats,
-               COUNT(DISTINCT username) as unique_tokens
-        FROM faucet_payments
+        SELECT COUNT(*) as issued_count,
+               COALESCE(SUM(amount_sats), 0) as issued_sats,
+               COALESCE(SUM(CASE WHEN paid = 1 THEN 1 ELSE 0 END), 0) as paid_count,
+               COALESCE(SUM(CASE WHEN paid = 1 THEN amount_sats ELSE 0 END), 0) as paid_sats
+        FROM l402_invoices
         WHERE created_at > $1
-          AND username LIKE 'l402:%'
-          AND payment_type NOT IN ('l402_issued', 'l402_paid')
         "#,
     )
     .bind(cutoff)
     .fetch_one(pool)
     .await?;
 
-    // Timeseries for issued tokens
+    // Timeseries for issued
     let issued_rows = sqlx::query(
         r#"
         SELECT strftime($1, created_at, 'unixepoch') as bucket,
                COUNT(*) as count,
                COALESCE(SUM(amount_sats), 0) as total_sats
-        FROM faucet_payments
-        WHERE created_at > $2 AND payment_type = 'l402_issued'
+        FROM l402_invoices
+        WHERE created_at > $2
         GROUP BY bucket
         ORDER BY bucket ASC
         "#,
@@ -698,14 +693,14 @@ pub async fn analytics_l402(
         })
         .collect();
 
-    // Timeseries for paid invoices
+    // Timeseries for paid (by paid_at timestamp)
     let paid_rows = sqlx::query(
         r#"
-        SELECT strftime($1, created_at, 'unixepoch') as bucket,
+        SELECT strftime($1, paid_at, 'unixepoch') as bucket,
                COUNT(*) as count,
                COALESCE(SUM(amount_sats), 0) as total_sats
-        FROM faucet_payments
-        WHERE created_at > $2 AND payment_type = 'l402_paid'
+        FROM l402_invoices
+        WHERE paid = 1 AND paid_at > $2
         GROUP BY bucket
         ORDER BY bucket ASC
         "#,
@@ -726,16 +721,26 @@ pub async fn analytics_l402(
         })
         .collect();
 
-    // Timeseries for payments made by L402 users
+    // Usage: faucet payments made by L402-authenticated users
+    let usage_summary = sqlx::query(
+        r#"
+        SELECT COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats,
+               COUNT(DISTINCT username) as unique_tokens
+        FROM faucet_payments
+        WHERE created_at > $1 AND username LIKE 'l402:%'
+        "#,
+    )
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await?;
+
     let usage_rows = sqlx::query(
         r#"
         SELECT strftime($1, created_at, 'unixepoch') as bucket,
                COUNT(*) as count,
                COALESCE(SUM(amount_sats), 0) as total_sats
         FROM faucet_payments
-        WHERE created_at > $2
-          AND username LIKE 'l402:%'
-          AND payment_type NOT IN ('l402_issued', 'l402_paid')
+        WHERE created_at > $2 AND username LIKE 'l402:%'
         GROUP BY bucket
         ORDER BY bucket ASC
         "#,
@@ -760,13 +765,13 @@ pub async fn analytics_l402(
         "hours": hours,
         "interval": interval,
         "issued": {
-            "count": issued_summary.get::<i64, _>("count"),
-            "total_sats": issued_summary.get::<i64, _>("total_sats"),
+            "count": summary.get::<i64, _>("issued_count"),
+            "total_sats": summary.get::<i64, _>("issued_sats"),
             "timeseries": issued_buckets,
         },
         "paid": {
-            "count": paid_summary.get::<i64, _>("count"),
-            "total_sats": paid_summary.get::<i64, _>("total_sats"),
+            "count": summary.get::<i64, _>("paid_count"),
+            "total_sats": summary.get::<i64, _>("paid_sats"),
             "timeseries": paid_buckets,
         },
         "usage": {

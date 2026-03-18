@@ -551,14 +551,11 @@ async fn generate_l402_challenge(state: &AppState) -> Result<L402HandlerResponse
     )
     .await?;
 
-    if let Some(tx) = &state.analytics_writer {
-        analytics::record_payment(
-            tx,
-            "l402_issued",
+    if let Some(pool) = &state.analytics_db {
+        analytics::record_l402_issued(
+            pool,
+            &response.payment_hash,
             state.l402_config.invoice_amount_sats,
-            None,
-            "n/a",
-            Some(&response.invoice),
         );
     }
 
