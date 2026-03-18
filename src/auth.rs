@@ -186,21 +186,17 @@ pub async fn auth_middleware<B>(
         }
     } else if let Some(credentials) = auth_header.strip_prefix("L402 ") {
         // L402 Lightning payment path
-        let (token, preimage_hex) = credentials
-            .split_once(':')
-            .ok_or(AuthError::InvalidToken)?;
+        let (token, preimage_hex) = credentials.split_once(':').ok_or(AuthError::InvalidToken)?;
 
         if token.is_empty() || preimage_hex.is_empty() {
             return Err(AuthError::MissingToken);
         }
 
-        let payment_hash =
-            validate_l402_credentials(token, preimage_hex, &state.auth.jwt_secret).map_err(
-                |e| match e {
-                    L402Error::TokenExpired => AuthError::TokenExpired,
-                    _ => AuthError::InvalidToken,
-                },
-            )?;
+        let payment_hash = validate_l402_credentials(token, preimage_hex, &state.auth.jwt_secret)
+            .map_err(|e| match e {
+            L402Error::TokenExpired => AuthError::TokenExpired,
+            _ => AuthError::InvalidToken,
+        })?;
 
         AuthUser {
             username: format!("l402:{}", payment_hash),

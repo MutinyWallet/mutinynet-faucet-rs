@@ -95,5 +95,16 @@ pub async fn open_channel(
         .add_payment(x_forwarded_for, None, user, payload.capacity as u64)
         .await;
 
+    if let Some(tx) = &state.analytics_writer {
+        crate::analytics::record_payment(
+            tx,
+            "channel",
+            payload.capacity as u64,
+            user.map(|u| u.username.as_str()),
+            x_forwarded_for,
+            Some(&payload.pubkey),
+        );
+    }
+
     Ok(txid)
 }

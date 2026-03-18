@@ -133,5 +133,16 @@ pub async fn pay_lightning(
         response.payment_preimage
     };
 
+    if let Some(tx) = &state.analytics_writer {
+        crate::analytics::record_payment(
+            tx,
+            "lightning",
+            invoice.amount_milli_satoshis().unwrap_or(0) / 1000,
+            user.map(|u| u.username.as_str()),
+            x_forwarded_for,
+            Some(&invoice.to_string()),
+        );
+    }
+
     Ok(hex::encode(payment_preimage))
 }

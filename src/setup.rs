@@ -7,6 +7,7 @@ use log::{info, warn};
 use nostr::key::Keys;
 use tonic_openssl_lnd::lnrpc;
 
+use crate::analytics::{init_analytics_db, start_write_batcher};
 use crate::auth::AuthState;
 use crate::l402::L402Config;
 use crate::reorg::init_reorg_db;
@@ -265,6 +266,24 @@ pub async fn setup() -> anyhow::Result<AppState> {
         invoice_amount_sats: l402_invoice_amount_sats,
     };
 
+    // Initialize analytics database
+    let analytics_db_path =
+        env::var("ANALYTICS_DB_PATH").unwrap_or_else(|_| "analytics.db".to_string());
+    let (analytics_db, analytics_writer) = match init_analytics_db(&analytics_db_path).await {
+        Ok(pool) => {
+            info!("Analytics database initialized at {}", analytics_db_path);
+            let writer = start_write_batcher(pool.clone());
+            (Some(pool), Some(writer))
+        }
+        Err(e) => {
+            warn!(
+                "Failed to initialize analytics database: {}. Analytics disabled.",
+                e
+            );
+            (None, None)
+        }
+    };
+
     Ok(AppState::new(
         host,
         keys,
@@ -276,5 +295,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
         auth,
         reorg_config,
         l402_config,
+        analytics_db,
+        analytics_writer,
     ))
 }

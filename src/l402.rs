@@ -111,8 +111,7 @@ mod tests {
     use super::*;
 
     const TEST_SECRET: &str = "test_secret";
-    const TEST_PREIMAGE: &str =
-        "0000000000000000000000000000000000000000000000000000000000000001";
+    const TEST_PREIMAGE: &str = "0000000000000000000000000000000000000000000000000000000000000001";
 
     fn test_payment_hash() -> String {
         let preimage_bytes = Vec::<u8>::from_hex(TEST_PREIMAGE).unwrap();
@@ -169,8 +168,7 @@ mod tests {
         let payment_hash = test_payment_hash();
         let token = make_test_token(&payment_hash, TEST_SECRET, 24);
 
-        let wrong_preimage =
-            "0000000000000000000000000000000000000000000000000000000000000002";
+        let wrong_preimage = "0000000000000000000000000000000000000000000000000000000000000002";
         let result = validate_l402_credentials(&token, wrong_preimage, TEST_SECRET);
         assert_eq!(result, Err(L402Error::InvalidPreimage));
     }

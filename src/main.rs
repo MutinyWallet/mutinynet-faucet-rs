@@ -23,23 +23,27 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{AllowMethods, Any, CorsLayer};
 
+use crate::analytics::{
+    analytics_recent, analytics_summary, analytics_timeseries, analytics_users,
+};
 use crate::auth::{auth_middleware, is_premium, AuthState, AuthUser, GithubCallback};
 use crate::nostr_dms::listen_to_nostr_dms;
 use crate::payments::PaymentsByIp;
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
 use channel::{open_channel, ChannelRequest, ChannelResponse};
+use l402::{generate_l402_token, L402Config};
 use lightning::{pay_lightning, LightningRequest, LightningResponse};
 use onchain::{pay_onchain, OnchainRequest, OnchainResponse};
-use l402::{generate_l402_token, L402Config};
 use reorg::{
     generate_reorg_invoice, start_reorg_invoice_listener, ReorgInvoiceRequest, ReorgInvoiceResponse,
 };
 use setup::setup;
 
+mod analytics;
 mod auth;
 mod bolt11;
 mod channel;
@@ -65,6 +69,10 @@ pub struct AppState {
     auth: AuthState,
     reorg_config: ReorgConfig,
     l402_config: L402Config,
+    /// Pool for read queries (dashboard endpoints)
+    pub analytics_db: Option<SqlitePool>,
+    /// Batched writer channel for recording payments
+    pub analytics_writer: Option<mpsc::UnboundedSender<analytics::AnalyticsPayment>>,
 }
 
 #[derive(Clone)]
@@ -87,6 +95,8 @@ impl AppState {
         auth: AuthState,
         reorg_config: ReorgConfig,
         l402_config: L402Config,
+        analytics_db: Option<SqlitePool>,
+        analytics_writer: Option<mpsc::UnboundedSender<analytics::AnalyticsPayment>>,
     ) -> Self {
         let lnurl = lnurl::Builder::default().build_async().unwrap();
         AppState {
@@ -102,6 +112,8 @@ impl AppState {
             auth,
             reorg_config,
             l402_config,
+            analytics_db,
+            analytics_writer,
         }
     }
 }
@@ -142,6 +154,10 @@ async fn main() -> anyhow::Result<()> {
             "/api/reorg/invoice",
             post(reorg_invoice_handler).route_layer(middleware::from_fn(auth_middleware)),
         )
+        .route("/api/analytics/summary", get(analytics_summary))
+        .route("/api/analytics/timeseries", get(analytics_timeseries))
+        .route("/api/analytics/users", get(analytics_users))
+        .route("/api/analytics/recent", get(analytics_recent))
         .fallback(fallback)
         .layer(Extension(state.clone()))
         .layer(
@@ -575,8 +591,8 @@ async fn l402_check_handler(
     .map_err(|_| AppError::new("Invalid token"))?;
 
     let payment_hash_hex = &token_data.claims.payment_hash;
-    let payment_hash_bytes = hex::decode(payment_hash_hex)
-        .map_err(|_| AppError::new("Invalid payment hash"))?;
+    let payment_hash_bytes =
+        hex::decode(payment_hash_hex).map_err(|_| AppError::new("Invalid payment hash"))?;
 
     let lookup_request = tonic_openssl_lnd::lnrpc::PaymentHash {
         r_hash: payment_hash_bytes,

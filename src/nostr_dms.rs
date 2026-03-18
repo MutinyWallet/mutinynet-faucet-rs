@@ -59,7 +59,11 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
     }
 }
 
-async fn pay_invoice(invoice: Bolt11Invoice, state: &AppState) -> anyhow::Result<()> {
+async fn pay_invoice(
+    invoice: Bolt11Invoice,
+    state: &AppState,
+    nostr_pubkey: &str,
+) -> anyhow::Result<()> {
     // only pay if invoice has a valid amount
     if invoice
         .amount_milli_satoshis()
@@ -78,6 +82,17 @@ async fn pay_invoice(invoice: Bolt11Invoice, state: &AppState) -> anyhow::Result
 
         if !response.payment_error.is_empty() {
             return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
+        }
+
+        if let Some(tx) = &state.analytics_writer {
+            crate::analytics::record_payment(
+                tx,
+                "nostr_dm",
+                invoice.amount_milli_satoshis().unwrap_or(0) / 1000,
+                Some(nostr_pubkey),
+                nostr_pubkey,
+                Some(&invoice.to_string()),
+            );
         }
 
         Ok(())
@@ -143,6 +158,7 @@ async fn get_invoice(
 
 async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
     event.verify()?;
+    let pubkey_str = event.pubkey.to_string();
     let decrypted = nip04::decrypt(state.keys.secret_key()?, &event.pubkey, &event.content)?;
 
     if decrypted.to_lowercase() == "zap me" {
@@ -150,20 +166,20 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
         let lnurl = get_lnurl(event.pubkey).await?;
         let invoice = get_invoice(&lnurl, event.pubkey, &state).await?;
 
-        pay_invoice(invoice, &state).await?;
+        pay_invoice(invoice, &state, &pubkey_str).await?;
     } else if decrypted.to_lowercase() == "spam me" {
         info!("Spamming");
         let lnurl = get_lnurl(event.pubkey).await?;
 
         for _ in 0..25 {
             let invoice = get_invoice(&lnurl, event.pubkey, &state).await?;
-            pay_invoice(invoice, &state).await?;
+            pay_invoice(invoice, &state, &pubkey_str).await?;
         }
     }
 
     if let Ok(params) = PaymentParams::from_str(&decrypted) {
         if let Some(invoice) = params.invoice() {
-            pay_invoice(invoice, &state).await?;
+            pay_invoice(invoice, &state, &pubkey_str).await?;
         }
 
         if let Some(address) = params.address() {
@@ -215,6 +231,17 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
             };
 
             let txid = resp.txid;
+
+            if let Some(tx) = &state.analytics_writer {
+                crate::analytics::record_payment(
+                    tx,
+                    "nostr_dm_onchain",
+                    amount.to_sat(),
+                    Some(&pubkey_str),
+                    &pubkey_str,
+                    Some(&address.to_string()),
+                );
+            }
 
             info!("Sent onchain tx: {txid}");
             return Ok(());

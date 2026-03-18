@@ -1,0 +1,199 @@
+# Analytics API
+
+The faucet records every payment to a local SQLite database and exposes read-only endpoints for building dashboards. All endpoints return JSON.
+
+## Configuration
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `ANALYTICS_DB_PATH` | `analytics.db` | Path to the SQLite database file |
+
+The database is created automatically on startup. No migration steps are needed.
+
+## Payment Types
+
+Every recorded payment has a `payment_type` field. Possible values:
+
+| Type | Source | Description |
+|---|---|---|
+| `onchain` | `POST /api/onchain` | On-chain bitcoin send |
+| `lightning` | `POST /api/lightning`, `GET /api/lnurlw/callback` | Lightning invoice payment (includes LNURL-pay, lightning addresses, and zaps) |
+| `channel` | `POST /api/channel` | Lightning channel open |
+| `bolt11` | `POST /api/bolt11` | Invoice generation (receive-side testing) |
+| `nostr_dm` | Nostr DM listener | Lightning payment triggered via Nostr DM |
+| `nostr_dm_onchain` | Nostr DM listener | On-chain payment triggered via Nostr DM |
+
+## Common Query Parameters
+
+All endpoints (except `/recent`) accept:
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `hours` | integer | `24` | Rolling window to look back |
+| `payment_type` | string | _(all)_ | Filter to a single payment type |
+
+## Endpoints
+
+### `GET /api/analytics/summary`
+
+High-level KPIs for the time window. Use for dashboard header cards.
+
+**Extra params:** none
+
+**Response:**
+
+```json
+{
+  "hours": 24,
+  "total_count": 142,
+  "total_sats": 84200000,
+  "unique_users": 37,
+  "avg_sats": 593000,
+  "by_type": [
+    { "payment_type": "onchain", "count": 80, "total_sats": 60000000 },
+    { "payment_type": "lightning", "count": 50, "total_sats": 20000000 },
+    { "payment_type": "channel", "count": 12, "total_sats": 4200000 }
+  ]
+}
+```
+
+---
+
+### `GET /api/analytics/timeseries`
+
+Bucketed time series with per-type breakdown in each bucket. Use for stacked area/bar charts.
+
+**Extra params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `interval` | string | `hour` | Bucket size: `hour` or `day` |
+
+**Response:**
+
+```json
+{
+  "hours": 48,
+  "interval": "hour",
+  "buckets": [
+    {
+      "time": "2026-03-16T14:00:00Z",
+      "count": 5,
+      "total_sats": 2500000,
+      "by_type": [
+        { "payment_type": "onchain", "count": 3, "total_sats": 2000000 },
+        { "payment_type": "lightning", "count": 2, "total_sats": 500000 }
+      ]
+    },
+    {
+      "time": "2026-03-16T15:00:00Z",
+      "count": 8,
+      "total_sats": 4100000,
+      "by_type": [
+        { "payment_type": "onchain", "count": 4, "total_sats": 3000000 },
+        { "payment_type": "lightning", "count": 3, "total_sats": 900000 },
+        { "payment_type": "channel", "count": 1, "total_sats": 200000 }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+### `GET /api/analytics/users`
+
+Top users ranked by total sats, with per-type breakdown for each user.
+
+**Extra params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | integer | `50` | Max number of users to return |
+
+**Response:**
+
+```json
+{
+  "hours": 24,
+  "users": [
+    {
+      "user": "alice@example.com",
+      "count": 12,
+      "total_sats": 8400000,
+      "last_payment": 1710700000,
+      "by_type": [
+        { "payment_type": "onchain", "count": 8, "total_sats": 6000000 },
+        { "payment_type": "lightning", "count": 4, "total_sats": 2400000 }
+      ]
+    },
+    {
+      "user": "192.168.1.50",
+      "count": 3,
+      "total_sats": 1500000,
+      "last_payment": 1710695000,
+      "by_type": [
+        { "payment_type": "lightning", "count": 3, "total_sats": 1500000 }
+      ]
+    }
+  ]
+}
+```
+
+The `user` field is the GitHub email when authenticated, or the IP address for unauthenticated requests (LNURL-withdraw, Nostr DMs). `last_payment` is a Unix timestamp.
+
+---
+
+### `GET /api/analytics/recent`
+
+Most recent individual payments. Use for a live activity feed.
+
+**Params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | integer | `50` | Max number of payments to return |
+| `payment_type` | string | _(all)_ | Filter to a single payment type |
+
+Note: this endpoint does **not** accept `hours` — it always returns the N most recent payments regardless of age.
+
+**Response:**
+
+```json
+{
+  "payments": [
+    {
+      "id": 1042,
+      "created_at": 1710700123,
+      "payment_type": "onchain",
+      "amount_sats": 500000,
+      "user": "alice@example.com",
+      "destination": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
+    },
+    {
+      "id": 1041,
+      "created_at": 1710700100,
+      "payment_type": "lightning",
+      "amount_sats": 100000,
+      "user": "192.168.1.50",
+      "destination": "lnbc1u1pj..."
+    }
+  ]
+}
+```
+
+## Database Schema
+
+```sql
+CREATE TABLE faucet_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    payment_type TEXT NOT NULL,
+    amount_sats INTEGER NOT NULL,
+    username TEXT,
+    ip_address TEXT NOT NULL,
+    destination TEXT
+);
+```
+
+Indexes on `created_at`, `username`, and `payment_type`.
