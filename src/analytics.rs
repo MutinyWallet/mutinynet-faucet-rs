@@ -46,15 +46,41 @@ pub async fn init_analytics_db(path: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
-    // Composite index for timeseries queries (filter by created_at, group by payment_type)
+    // Drop old non-covering indexes replaced by covering ones below
+    sqlx::query("DROP INDEX IF EXISTS idx_faucet_payments_created_type")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_faucet_payments_username")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_faucet_payments_created_at")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_faucet_payments_payment_type")
+        .execute(&pool)
+        .await?;
+    sqlx::query("DROP INDEX IF EXISTS idx_l402_invoices_created_at")
+        .execute(&pool)
+        .await?;
+
+    // Covering index for summary + timeseries: filter by created_at, group by payment_type, sum amount_sats
+    // SQLite can answer these queries entirely from the index without touching the table
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_faucet_payments_created_type ON faucet_payments (created_at, payment_type)",
+        "CREATE INDEX IF NOT EXISTS idx_faucet_payments_covering ON faucet_payments (created_at, payment_type, amount_sats)",
     )
     .execute(&pool)
     .await?;
 
+    // Covering index for users + domains queries: group by username, filter by created_at, sum amount_sats
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_faucet_payments_username ON faucet_payments (username)",
+        "CREATE INDEX IF NOT EXISTS idx_faucet_payments_user_covering ON faucet_payments (username, created_at, amount_sats, ip_address)",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Index for recent payments (ORDER BY created_at DESC)
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_faucet_payments_recent ON faucet_payments (created_at DESC)",
     )
     .execute(&pool)
     .await?;
@@ -74,8 +100,9 @@ pub async fn init_analytics_db(path: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    // Covering index for L402 queries: filter by created_at, conditional on paid, sum amount_sats
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_l402_invoices_created_at ON l402_invoices (created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_l402_invoices_covering ON l402_invoices (created_at, paid, amount_sats, paid_at)",
     )
     .execute(&pool)
     .await?;
