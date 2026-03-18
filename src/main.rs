@@ -1,6 +1,7 @@
 use axum::extract::Query;
 use axum::headers::{HeaderMap, HeaderValue};
-use axum::http::Uri;
+use axum::http::{Request, Uri};
+use axum::middleware::Next;
 use axum::response::Redirect;
 use axum::{
     http::StatusCode,
@@ -73,6 +74,8 @@ pub struct AppState {
     pub analytics_db: Option<SqlitePool>,
     /// Batched writer channel for recording payments
     pub analytics_writer: Option<mpsc::UnboundedSender<analytics::AnalyticsPayment>>,
+    /// API token for analytics endpoints
+    pub analytics_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -97,6 +100,7 @@ impl AppState {
         l402_config: L402Config,
         analytics_db: Option<SqlitePool>,
         analytics_writer: Option<mpsc::UnboundedSender<analytics::AnalyticsPayment>>,
+        analytics_token: Option<String>,
     ) -> Self {
         let lnurl = lnurl::Builder::default().build_async().unwrap();
         AppState {
@@ -114,6 +118,7 @@ impl AppState {
             l402_config,
             analytics_db,
             analytics_writer,
+            analytics_token,
         }
     }
 }
@@ -154,10 +159,22 @@ async fn main() -> anyhow::Result<()> {
             "/api/reorg/invoice",
             post(reorg_invoice_handler).route_layer(middleware::from_fn(auth_middleware)),
         )
-        .route("/api/analytics/summary", get(analytics_summary))
-        .route("/api/analytics/timeseries", get(analytics_timeseries))
-        .route("/api/analytics/users", get(analytics_users))
-        .route("/api/analytics/recent", get(analytics_recent))
+        .route(
+            "/api/analytics/summary",
+            get(analytics_summary).route_layer(middleware::from_fn(analytics_auth_middleware)),
+        )
+        .route(
+            "/api/analytics/timeseries",
+            get(analytics_timeseries).route_layer(middleware::from_fn(analytics_auth_middleware)),
+        )
+        .route(
+            "/api/analytics/users",
+            get(analytics_users).route_layer(middleware::from_fn(analytics_auth_middleware)),
+        )
+        .route(
+            "/api/analytics/recent",
+            get(analytics_recent).route_layer(middleware::from_fn(analytics_auth_middleware)),
+        )
         .fallback(fallback)
         .layer(Extension(state.clone()))
         .layer(
@@ -699,6 +716,34 @@ where
     fn from(err: E) -> Self {
         Self(err.into())
     }
+}
+
+async fn analytics_auth_middleware<B>(
+    headers: HeaderMap,
+    request: Request<B>,
+    next: Next<B>,
+) -> Result<Response, StatusCode> {
+    let state = request
+        .extensions()
+        .get::<AppState>()
+        .expect("AppState not found in extensions");
+
+    let token = match &state.analytics_token {
+        Some(t) => t,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    let provided = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    if provided != token {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(request).await)
 }
 
 async fn fallback(uri: Uri) -> (StatusCode, String) {

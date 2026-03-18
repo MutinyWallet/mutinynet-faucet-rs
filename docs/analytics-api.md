@@ -7,8 +7,19 @@ The faucet records every payment to a local SQLite database and exposes read-onl
 | Environment Variable | Default | Description |
 |---|---|---|
 | `ANALYTICS_DB_PATH` | `analytics.db` | Path to the SQLite database file |
+| `ANALYTICS_TOKEN` | _(none)_ | API token for analytics endpoints. **Required** — endpoints return 404 if unset. |
 
 The database is created automatically on startup. No migration steps are needed.
+
+## Authentication
+
+All analytics endpoints require a Bearer token matching the `ANALYTICS_TOKEN` environment variable:
+
+```
+Authorization: Bearer <your-analytics-token>
+```
+
+Returns `401 Unauthorized` if the token is missing or wrong. Returns `404 Not Found` if `ANALYTICS_TOKEN` is not configured (endpoints are hidden).
 
 ## Payment Types
 
