@@ -34,6 +34,7 @@ Every recorded payment has a `payment_type` field. Possible values:
 | `nostr_dm` | Nostr DM listener | Lightning payment triggered via Nostr DM |
 | `nostr_dm_onchain` | Nostr DM listener | On-chain payment triggered via Nostr DM |
 | `l402_issued` | `POST /api/l402`, `GET /api/l402` | L402 authentication token issued (mainnet invoice created) |
+| `l402_paid` | `GET /api/l402/check` | L402 invoice confirmed paid (deduplicated by payment hash) |
 
 ## Common Query Parameters
 
@@ -248,6 +249,14 @@ Note: this endpoint does **not** accept `payment_type` — it's L402-specific.
       { "time": "2026-03-16T15:00:00Z", "count": 5, "total_sats": 5000 }
     ]
   },
+  "paid": {
+    "count": 30,
+    "total_sats": 30000,
+    "timeseries": [
+      { "time": "2026-03-16T14:00:00Z", "count": 2, "total_sats": 2000 },
+      { "time": "2026-03-16T15:00:00Z", "count": 4, "total_sats": 4000 }
+    ]
+  },
   "usage": {
     "count": 12,
     "total_sats": 6000000,
@@ -260,7 +269,8 @@ Note: this endpoint does **not** accept `payment_type` — it's L402-specific.
 }
 ```
 
-- `issued` — L402 tokens created (mainnet invoices). `total_sats` is the invoice amount (revenue).
+- `issued` — L402 tokens created (mainnet invoices generated).
+- `paid` — L402 invoices actually paid (confirmed settled). Deduplicated by payment hash. Compare `issued` vs `paid` to see conversion rate. `total_sats` is revenue collected.
 - `usage` — faucet payments made by users who authenticated via L402. `unique_tokens` is the number of distinct L402 tokens used.
 
 ---

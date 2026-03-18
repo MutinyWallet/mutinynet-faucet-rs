@@ -142,6 +142,47 @@ pub fn record_payment(
     });
 }
 
+/// Records a payment only if no existing record with the same payment_type and destination exists.
+/// Used for events that may be triggered multiple times (e.g. polling endpoints).
+pub fn record_payment_once(
+    pool: &SqlitePool,
+    payment_type: &str,
+    amount_sats: u64,
+    destination: &str,
+) {
+    let pool = pool.clone();
+    let payment_type = payment_type.to_string();
+    let destination = destination.to_string();
+
+    tokio::spawn(async move {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM faucet_payments WHERE payment_type = $1 AND destination = $2)",
+        )
+        .bind(&payment_type)
+        .bind(&destination)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(true);
+
+        if exists {
+            return;
+        }
+
+        let result = sqlx::query(
+            "INSERT INTO faucet_payments (payment_type, amount_sats, username, ip_address, destination) VALUES ($1, $2, NULL, 'n/a', $3)",
+        )
+        .bind(&payment_type)
+        .bind(amount_sats as i64)
+        .bind(&destination)
+        .execute(&pool)
+        .await;
+
+        if let Err(e) = result {
+            error!("Failed to record analytics payment: {e}");
+        }
+    });
+}
+
 fn get_pool(state: &crate::AppState) -> Result<&SqlitePool, AppError> {
     state
         .analytics_db
@@ -602,6 +643,18 @@ pub async fn analytics_l402(
     .fetch_one(pool)
     .await?;
 
+    // Invoices actually paid (l402_paid events, deduplicated by payment_hash)
+    let paid_summary = sqlx::query(
+        r#"
+        SELECT COUNT(*) as count, COALESCE(SUM(amount_sats), 0) as total_sats
+        FROM faucet_payments
+        WHERE created_at > $1 AND payment_type = 'l402_paid'
+        "#,
+    )
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await?;
+
     // Payments made by L402-authenticated users (username starts with 'l402:')
     let usage_summary = sqlx::query(
         r#"
@@ -610,7 +663,7 @@ pub async fn analytics_l402(
         FROM faucet_payments
         WHERE created_at > $1
           AND username LIKE 'l402:%'
-          AND payment_type != 'l402_issued'
+          AND payment_type NOT IN ('l402_issued', 'l402_paid')
         "#,
     )
     .bind(cutoff)
@@ -645,6 +698,34 @@ pub async fn analytics_l402(
         })
         .collect();
 
+    // Timeseries for paid invoices
+    let paid_rows = sqlx::query(
+        r#"
+        SELECT strftime($1, created_at, 'unixepoch') as bucket,
+               COUNT(*) as count,
+               COALESCE(SUM(amount_sats), 0) as total_sats
+        FROM faucet_payments
+        WHERE created_at > $2 AND payment_type = 'l402_paid'
+        GROUP BY bucket
+        ORDER BY bucket ASC
+        "#,
+    )
+    .bind(format_str)
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+
+    let paid_buckets: Vec<Value> = paid_rows
+        .iter()
+        .map(|row| {
+            json!({
+                "time": row.get::<String, _>("bucket"),
+                "count": row.get::<i64, _>("count"),
+                "total_sats": row.get::<i64, _>("total_sats"),
+            })
+        })
+        .collect();
+
     // Timeseries for payments made by L402 users
     let usage_rows = sqlx::query(
         r#"
@@ -654,7 +735,7 @@ pub async fn analytics_l402(
         FROM faucet_payments
         WHERE created_at > $2
           AND username LIKE 'l402:%'
-          AND payment_type != 'l402_issued'
+          AND payment_type NOT IN ('l402_issued', 'l402_paid')
         GROUP BY bucket
         ORDER BY bucket ASC
         "#,
@@ -682,6 +763,11 @@ pub async fn analytics_l402(
             "count": issued_summary.get::<i64, _>("count"),
             "total_sats": issued_summary.get::<i64, _>("total_sats"),
             "timeseries": issued_buckets,
+        },
+        "paid": {
+            "count": paid_summary.get::<i64, _>("count"),
+            "total_sats": paid_summary.get::<i64, _>("total_sats"),
+            "timeseries": paid_buckets,
         },
         "usage": {
             "count": usage_summary.get::<i64, _>("count"),
