@@ -5,8 +5,10 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use jsonwebtoken::{decode, DecodingKey, Validation};
+use log::info;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 
 #[derive(Clone)]
 pub struct AuthState {
@@ -59,88 +61,157 @@ impl IntoResponse for AuthError {
     }
 }
 
-fn banned_domains() -> Vec<String> {
-    let mut domains = vec![];
-    let file = std::fs::read_to_string("faucet_config/banned_domains.txt");
-    if let Ok(file) = file {
-        for line in file.lines() {
+pub async fn init_users_db(path: &str) -> anyhow::Result<SqlitePool> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let pool = SqlitePool::connect(&format!("sqlite:{}?mode=rwc", path)).await?;
+
+    sqlx::query("PRAGMA journal_mode=WAL")
+        .execute(&pool)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS banned_domains (
+            domain TEXT PRIMARY KEY NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS banned_users (
+            email TEXT PRIMARY KEY NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS whitelisted_users (
+            email TEXT PRIMARY KEY NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS premium_users (
+            email TEXT PRIMARY KEY NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Migrate from text files if tables are empty and files exist
+    migrate_from_files(&pool).await;
+
+    Ok(pool)
+}
+
+async fn migrate_from_files(pool: &SqlitePool) {
+    let files: &[(&str, &str, &str)] = &[
+        (
+            "faucet_config/banned_domains.txt",
+            "banned_domains",
+            "INSERT OR IGNORE INTO banned_domains (domain) VALUES (?)",
+        ),
+        (
+            "faucet_config/banned_users.txt",
+            "banned_users",
+            "INSERT OR IGNORE INTO banned_users (email) VALUES (?)",
+        ),
+        (
+            "faucet_config/whitelisted_users.txt",
+            "whitelisted_users",
+            "INSERT OR IGNORE INTO whitelisted_users (email) VALUES (?)",
+        ),
+        (
+            "faucet_config/premium_users.txt",
+            "premium_users",
+            "INSERT OR IGNORE INTO premium_users (email) VALUES (?)",
+        ),
+    ];
+
+    for (file_path, table_name, insert_sql) in files {
+        // Skip if the text file doesn't exist
+        let contents = match std::fs::read_to_string(file_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // Skip if the table already has data (already migrated)
+        let query = format!("SELECT COUNT(*) FROM {}", table_name);
+        let count: (i64,) = sqlx::query_as(&query)
+            .fetch_one(pool)
+            .await
+            .unwrap_or((1,));
+        if count.0 > 0 {
+            info!(
+                "Skipping migration of {} — table {} already has {} entries",
+                file_path, table_name, count.0
+            );
+            continue;
+        }
+
+        let mut migrated = 0u32;
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => continue,
+        };
+        for line in contents.lines() {
             let line = line.trim();
             if !line.is_empty() {
-                domains.push(line.to_string());
+                let _ = sqlx::query(insert_sql).bind(line).execute(&mut *tx).await;
+                migrated += 1;
             }
         }
+        let _ = tx.commit().await;
+        info!("Migrated {} entries from {} into {}", migrated, file_path, table_name);
     }
-    domains
 }
 
-fn get_banned_users() -> Vec<String> {
-    let mut banned_users = vec![];
-    let file = std::fs::read_to_string("faucet_config/banned_users.txt");
-    if let Ok(file) = file {
-        for line in file.lines() {
-            let line = line.trim();
-            if !line.is_empty() {
-                banned_users.push(line.to_string());
-            }
-        }
-    }
-    banned_users
+pub struct UserStatus {
+    pub is_banned: bool,
+    pub is_premium: bool,
 }
 
-fn get_whitelisted_users() -> Vec<String> {
-    let mut whitelisted_users = vec![];
-    let file = std::fs::read_to_string("faucet_config/whitelisted_users.txt");
-    if let Ok(file) = file {
-        for line in file.lines() {
-            let line = line.trim();
-            if !line.is_empty() {
-                whitelisted_users.push(line.to_string());
-            }
-        }
+/// Single-query check for ban and premium status.
+pub async fn check_user_status(pool: &SqlitePool, email: &str) -> UserStatus {
+    let domain = email.split('@').next_back().unwrap_or("");
+    let result: (i32, i32, i32, i32) = sqlx::query_as(
+        "SELECT
+            EXISTS(SELECT 1 FROM whitelisted_users WHERE email = ?1),
+            EXISTS(SELECT 1 FROM premium_users WHERE email = ?1),
+            EXISTS(SELECT 1 FROM banned_domains WHERE domain = LOWER(?2)),
+            EXISTS(SELECT 1 FROM banned_users WHERE email = ?1)",
+    )
+    .bind(email)
+    .bind(domain)
+    .fetch_one(pool)
+    .await
+    .unwrap_or((0, 0, 0, 0));
+
+    let whitelisted = result.0 != 0;
+    let premium = result.1 != 0;
+    let domain_banned = result.2 != 0;
+    let user_banned = result.3 != 0;
+
+    UserStatus {
+        is_premium: premium,
+        is_banned: !whitelisted && !premium && (domain_banned || user_banned),
     }
-    whitelisted_users
 }
 
-fn get_premium_users() -> Vec<String> {
-    let mut premium_users = vec![];
-    let file = std::fs::read_to_string("faucet_config/premium_users.txt");
-    if let Ok(file) = file {
-        for line in file.lines() {
-            let line = line.trim();
-            if !line.is_empty() {
-                premium_users.push(line.to_string());
-            }
-        }
-    }
-    premium_users
+pub async fn is_banned(pool: &SqlitePool, email: &str) -> bool {
+    check_user_status(pool, email).await.is_banned
 }
 
-pub fn is_premium(email: &String) -> bool {
-    let premium_users = get_premium_users();
-    premium_users.contains(email)
-}
-
-pub fn is_banned(email: &String) -> bool {
-    let whitelisted_users = get_whitelisted_users();
-    if whitelisted_users.contains(email) {
-        return false;
-    }
-    if is_premium(email) {
-        return false;
-    }
-    let domains = banned_domains();
-    let user_host = email.split('@').next_back().unwrap_or("");
-    if domains.contains(&user_host.to_lowercase()) {
-        return true;
-    }
-    let banned_users = get_banned_users();
-    banned_users.contains(email)
-}
-
-// Middleware extractor for authenticated users
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub username: String,
+    pub is_premium: bool,
 }
 
 // Middleware for JWT and L402 verification
@@ -177,12 +248,14 @@ pub async fn auth_middleware<B>(
             return Err(AuthError::TokenExpired);
         }
 
-        if is_banned(&token_data.claims.sub) {
+        let status = check_user_status(&state.users_db, &token_data.claims.sub).await;
+        if status.is_banned {
             return Err(AuthError::TokenExpired);
         }
 
         AuthUser {
             username: token_data.claims.sub,
+            is_premium: status.is_premium,
         }
     } else if let Some(credentials) = auth_header.strip_prefix("L402 ") {
         // L402 Lightning payment path
@@ -204,6 +277,7 @@ pub async fn auth_middleware<B>(
 
         AuthUser {
             username: format!("l402:{}", payment_hash),
+            is_premium: false,
         }
     } else {
         return Err(AuthError::InvalidToken);

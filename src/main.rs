@@ -32,7 +32,8 @@ use crate::analytics::{
     analytics_balance, analytics_combined, analytics_domains, analytics_l402, analytics_recent,
     analytics_summary, analytics_timeseries, analytics_users,
 };
-use crate::auth::{auth_middleware, is_premium, AuthState, AuthUser, GithubCallback};
+use crate::admin::{admin_add, admin_list, admin_remove};
+use crate::auth::{auth_middleware, AuthState, AuthUser, GithubCallback};
 use crate::nostr_dms::listen_to_nostr_dms;
 use crate::payments::PaymentsByIp;
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
@@ -45,6 +46,7 @@ use reorg::{
 };
 use setup::setup;
 
+mod admin;
 mod analytics;
 mod auth;
 mod bolt11;
@@ -71,6 +73,10 @@ pub struct AppState {
     auth: AuthState,
     reorg_config: ReorgConfig,
     l402_config: L402Config,
+    /// User management database (banned/premium/whitelisted users and domains)
+    pub users_db: SqlitePool,
+    /// API token for admin endpoints
+    pub admin_token: Option<String>,
     /// Pool for read queries (dashboard endpoints)
     pub analytics_db: Option<SqlitePool>,
     /// Batched writer channel for recording payments
@@ -99,6 +105,8 @@ impl AppState {
         auth: AuthState,
         reorg_config: ReorgConfig,
         l402_config: L402Config,
+        users_db: SqlitePool,
+        admin_token: Option<String>,
         analytics_db: Option<SqlitePool>,
         analytics_writer: Option<mpsc::UnboundedSender<analytics::AnalyticsPayment>>,
         analytics_token: Option<String>,
@@ -117,6 +125,8 @@ impl AppState {
             auth,
             reorg_config,
             l402_config,
+            users_db,
+            admin_token,
             analytics_db,
             analytics_writer,
             analytics_token,
@@ -191,6 +201,13 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/analytics",
             get(analytics_combined).route_layer(middleware::from_fn(analytics_auth_middleware)),
+        )
+        .route(
+            "/api/admin/:list",
+            get(admin_list)
+                .post(admin_add)
+                .delete(admin_remove)
+                .route_layer(middleware::from_fn(admin_auth_middleware)),
         )
         .fallback(fallback)
         .layer(Extension(state.clone()))
@@ -319,7 +336,7 @@ async fn github_device(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Check if user is banned
-    if auth::is_banned(&primary_email.email) {
+    if auth::is_banned(&state.users_db, &primary_email.email).await {
         warn!("User {} is banned!", primary_email.email);
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -396,7 +413,7 @@ async fn github_callback(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Check if user is banned
-    if auth::is_banned(&primary_email.email) {
+    if auth::is_banned(&state.users_db, &primary_email.email).await {
         warn!("User {} is banned!", primary_email.email);
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -453,7 +470,7 @@ async fn onchain_handler(
         .payments
         .verify_payments(x_forwarded_for, Some(&address_str), Some(&user))
         .await
-        && !is_premium(&user.username)
+        && !user.is_premium
     {
         return Err(AppError::new("Too many payments"));
     }
@@ -480,7 +497,7 @@ async fn lightning_handler(
         .payments
         .verify_payments(x_forwarded_for, None, Some(&user))
         .await
-        && !is_premium(&user.username)
+        && !user.is_premium
     {
         return Err(AppError::new("Too many payments"));
     }
@@ -692,7 +709,7 @@ async fn channel_handler(
         .payments
         .verify_payments(x_forwarded_for, None, Some(&user))
         .await
-        && !is_premium(&user.username)
+        && !user.is_premium
     {
         return Err(AppError::new("Too many payments"));
     }
@@ -743,6 +760,32 @@ where
     }
 }
 
+fn verify_bearer_token(headers: &HeaderMap, expected: &Option<String>) -> Result<(), StatusCode> {
+    let token = expected.as_deref().ok_or(StatusCode::NOT_FOUND)?;
+    let provided = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if provided != token {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
+}
+
+async fn admin_auth_middleware<B>(
+    headers: HeaderMap,
+    request: Request<B>,
+    next: Next<B>,
+) -> Result<Response, StatusCode> {
+    let state = request
+        .extensions()
+        .get::<AppState>()
+        .expect("AppState not found in extensions");
+    verify_bearer_token(&headers, &state.admin_token)?;
+    Ok(next.run(request).await)
+}
+
 async fn analytics_auth_middleware<B>(
     headers: HeaderMap,
     request: Request<B>,
@@ -752,22 +795,7 @@ async fn analytics_auth_middleware<B>(
         .extensions()
         .get::<AppState>()
         .expect("AppState not found in extensions");
-
-    let token = match &state.analytics_token {
-        Some(t) => t,
-        None => return Err(StatusCode::NOT_FOUND),
-    };
-
-    let provided = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-
-    if provided != token {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-
+    verify_bearer_token(&headers, &state.analytics_token)?;
     Ok(next.run(request).await)
 }
 

@@ -8,7 +8,7 @@ use nostr::key::Keys;
 use tonic_openssl_lnd::lnrpc;
 
 use crate::analytics::{init_analytics_db, start_write_batcher};
-use crate::auth::AuthState;
+use crate::auth::{init_users_db, AuthState};
 use crate::l402::L402Config;
 use crate::reorg::init_reorg_db;
 use crate::{AppState, ReorgConfig};
@@ -266,6 +266,12 @@ pub async fn setup() -> anyhow::Result<AppState> {
         invoice_amount_sats: l402_invoice_amount_sats,
     };
 
+    // Initialize users database (banned/premium/whitelisted users and domains)
+    let users_db_path =
+        env::var("USERS_DB_PATH").unwrap_or_else(|_| "users.db".to_string());
+    let users_db = init_users_db(&users_db_path).await?;
+    info!("Users database initialized at {}", users_db_path);
+
     // Initialize analytics database
     let analytics_db_path =
         env::var("ANALYTICS_DB_PATH").unwrap_or_else(|_| "analytics.db".to_string());
@@ -283,6 +289,13 @@ pub async fn setup() -> anyhow::Result<AppState> {
             (None, None)
         }
     };
+
+    let admin_token = env::var("ADMIN_TOKEN").ok();
+    if admin_token.is_some() {
+        info!("Admin API token configured");
+    } else {
+        warn!("ADMIN_TOKEN not set — admin endpoints will return 404");
+    }
 
     let analytics_token = env::var("ANALYTICS_TOKEN").ok();
     if analytics_token.is_some() {
@@ -302,6 +315,8 @@ pub async fn setup() -> anyhow::Result<AppState> {
         auth,
         reorg_config,
         l402_config,
+        users_db,
+        admin_token,
         analytics_db,
         analytics_writer,
         analytics_token,
