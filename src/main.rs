@@ -30,7 +30,7 @@ use tower_http::cors::{AllowMethods, Any, CorsLayer};
 
 use crate::analytics::{
     analytics_balance, analytics_combined, analytics_domains, analytics_l402, analytics_recent,
-    analytics_summary, analytics_timeseries, analytics_users,
+    analytics_summary, analytics_timeseries, analytics_users, user_recent,
 };
 use crate::admin::{admin_add, admin_list, admin_remove};
 use crate::auth::{auth_middleware, AuthState, AuthUser, GithubCallback, UsersCache};
@@ -173,6 +173,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/reorg/invoice",
             post(reorg_invoice_handler).route_layer(middleware::from_fn(auth_middleware)),
+        )
+        .route(
+            "/api/recent",
+            get(user_recent).route_layer(middleware::from_fn(auth_middleware)),
         )
         .route(
             "/api/analytics/summary",

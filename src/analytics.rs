@@ -580,6 +580,64 @@ pub async fn analytics_recent(
     })))
 }
 
+// -- Recent activity (user-facing) --
+
+#[derive(Deserialize)]
+pub struct UserRecentParams {
+    /// Max payments to return (default: 50)
+    pub limit: Option<i64>,
+    /// Filter to a specific payment type
+    pub payment_type: Option<String>,
+}
+
+pub async fn user_recent(
+    Extension(state): Extension<crate::AppState>,
+    Extension(user): Extension<crate::auth::AuthUser>,
+    Query(params): Query<UserRecentParams>,
+) -> Result<Json<Value>, AppError> {
+    let pool = get_pool(&state)?;
+
+    let limit = params.limit.unwrap_or(50);
+    let (type_filter, bind_type) = type_filter_clause(&params.payment_type, 2);
+
+    let query_str = format!(
+        r#"
+        SELECT id, created_at, payment_type, amount_sats,
+               COALESCE(username, ip_address) as user_id, destination
+        FROM faucet_payments
+        WHERE 1=1 {type_filter}
+        ORDER BY created_at DESC
+        LIMIT $1
+        "#,
+    );
+
+    let mut q = sqlx::query(&query_str).bind(limit);
+    if let Some(ref t) = bind_type {
+        q = q.bind(t);
+    }
+    let rows = q.fetch_all(pool).await?;
+
+    let payments: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let user_id = row.get::<String, _>("user_id");
+            let is_mine = user_id == user.username;
+            json!({
+                "id": row.get::<i64, _>("id"),
+                "created_at": row.get::<i64, _>("created_at"),
+                "payment_type": row.get::<String, _>("payment_type"),
+                "amount_sats": row.get::<i64, _>("amount_sats"),
+                "is_mine": is_mine,
+                "destination": row.get::<Option<String>, _>("destination"),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "payments": payments,
+    })))
+}
+
 // -- Domains --
 
 #[derive(Deserialize)]
