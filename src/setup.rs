@@ -8,7 +8,7 @@ use nostr::key::Keys;
 use tonic_openssl_lnd::lnrpc;
 
 use crate::analytics::{init_analytics_db, start_write_batcher};
-use crate::auth::{init_users_db, AuthState};
+use crate::auth::{init_users_db, AuthState, UsersCache};
 use crate::l402::L402Config;
 use crate::reorg::init_reorg_db;
 use crate::{AppState, ReorgConfig};
@@ -270,6 +270,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
     let users_db_path =
         env::var("USERS_DB_PATH").unwrap_or_else(|_| "users.db".to_string());
     let users_db = init_users_db(&users_db_path).await?;
+    let users_cache = UsersCache::load(&users_db).await?;
     info!("Users database initialized at {}", users_db_path);
 
     // Initialize analytics database
@@ -316,6 +317,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
         reorg_config,
         l402_config,
         users_db,
+        users_cache,
         admin_token,
         analytics_db,
         analytics_writer,

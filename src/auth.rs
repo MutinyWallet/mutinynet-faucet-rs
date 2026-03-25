@@ -9,6 +9,9 @@ use log::info;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct AuthState {
@@ -177,35 +180,102 @@ pub struct UserStatus {
     pub is_premium: bool,
 }
 
-/// Single-query check for ban and premium status.
-pub async fn check_user_status(pool: &SqlitePool, email: &str) -> UserStatus {
-    let domain = email.split('@').next_back().unwrap_or("");
-    let result: (i32, i32, i32, i32) = sqlx::query_as(
-        "SELECT
-            EXISTS(SELECT 1 FROM whitelisted_users WHERE email = ?1),
-            EXISTS(SELECT 1 FROM premium_users WHERE email = ?1),
-            EXISTS(SELECT 1 FROM banned_domains WHERE domain = LOWER(?2)),
-            EXISTS(SELECT 1 FROM banned_users WHERE email = ?1)",
-    )
-    .bind(email)
-    .bind(domain)
-    .fetch_one(pool)
-    .await
-    .unwrap_or((0, 0, 0, 0));
+struct UserSets {
+    banned_domains: HashSet<String>,
+    banned_users: HashSet<String>,
+    whitelisted_users: HashSet<String>,
+    premium_users: HashSet<String>,
+}
 
-    let whitelisted = result.0 != 0;
-    let premium = result.1 != 0;
-    let domain_banned = result.2 != 0;
-    let user_banned = result.3 != 0;
+pub struct UsersCache {
+    sets: RwLock<UserSets>,
+}
 
-    UserStatus {
-        is_premium: premium,
-        is_banned: !whitelisted && !premium && (domain_banned || user_banned),
+impl UsersCache {
+    pub async fn load(pool: &SqlitePool) -> anyhow::Result<Arc<Self>> {
+        let banned_domains = load_set(pool, "SELECT domain FROM banned_domains").await?;
+        let banned_users = load_set(pool, "SELECT email FROM banned_users").await?;
+        let whitelisted_users = load_set(pool, "SELECT email FROM whitelisted_users").await?;
+        let premium_users = load_set(pool, "SELECT email FROM premium_users").await?;
+
+        info!(
+            "Users cache loaded: {} banned domains, {} banned users, {} whitelisted, {} premium",
+            banned_domains.len(),
+            banned_users.len(),
+            whitelisted_users.len(),
+            premium_users.len(),
+        );
+
+        Ok(Arc::new(Self {
+            sets: RwLock::new(UserSets {
+                banned_domains,
+                banned_users,
+                whitelisted_users,
+                premium_users,
+            }),
+        }))
+    }
+
+    pub async fn check_status(&self, email: &str) -> UserStatus {
+        let sets = self.sets.read().await;
+        let whitelisted = sets.whitelisted_users.contains(email);
+        let premium = sets.premium_users.contains(email);
+        let domain = email.split('@').next_back().unwrap_or("");
+        let domain_banned = sets.banned_domains.contains(&domain.to_lowercase());
+        let user_banned = sets.banned_users.contains(email);
+
+        UserStatus {
+            is_premium: premium,
+            is_banned: !whitelisted && !premium && (domain_banned || user_banned),
+        }
+    }
+
+    pub async fn is_banned(&self, email: &str) -> bool {
+        self.check_status(email).await.is_banned
+    }
+
+    pub async fn list(&self, list: &str) -> Option<Vec<String>> {
+        let sets = self.sets.read().await;
+        let set = match list {
+            "banned_domains" => &sets.banned_domains,
+            "banned_users" => &sets.banned_users,
+            "whitelisted_users" => &sets.whitelisted_users,
+            "premium_users" => &sets.premium_users,
+            _ => return None,
+        };
+        let mut entries: Vec<String> = set.iter().cloned().collect();
+        entries.sort();
+        Some(entries)
+    }
+
+    pub async fn add(&self, list: &str, value: String) {
+        let mut sets = self.sets.write().await;
+        let set = match list {
+            "banned_domains" => &mut sets.banned_domains,
+            "banned_users" => &mut sets.banned_users,
+            "whitelisted_users" => &mut sets.whitelisted_users,
+            "premium_users" => &mut sets.premium_users,
+            _ => return,
+        };
+        set.insert(value);
+    }
+
+    pub async fn remove(&self, list: &str, value: &str) {
+        let mut sets = self.sets.write().await;
+        let set = match list {
+            "banned_domains" => &mut sets.banned_domains,
+            "banned_users" => &mut sets.banned_users,
+            "whitelisted_users" => &mut sets.whitelisted_users,
+            "premium_users" => &mut sets.premium_users,
+            _ => return,
+        };
+        set.remove(value);
     }
 }
 
-pub async fn is_banned(pool: &SqlitePool, email: &str) -> bool {
-    check_user_status(pool, email).await.is_banned
+async fn load_set(pool: &SqlitePool, query: &str) -> anyhow::Result<HashSet<String>> {
+    let rows: Vec<(String,)> = sqlx::query_as(query).fetch_all(pool).await?;
+    Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
 #[derive(Debug, Clone)]
@@ -248,7 +318,7 @@ pub async fn auth_middleware<B>(
             return Err(AuthError::TokenExpired);
         }
 
-        let status = check_user_status(&state.users_db, &token_data.claims.sub).await;
+        let status = state.users_cache.check_status(&token_data.claims.sub).await;
         if status.is_banned {
             return Err(AuthError::TokenExpired);
         }

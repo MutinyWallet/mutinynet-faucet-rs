@@ -33,7 +33,7 @@ use crate::analytics::{
     analytics_summary, analytics_timeseries, analytics_users,
 };
 use crate::admin::{admin_add, admin_list, admin_remove};
-use crate::auth::{auth_middleware, AuthState, AuthUser, GithubCallback};
+use crate::auth::{auth_middleware, AuthState, AuthUser, GithubCallback, UsersCache};
 use crate::nostr_dms::listen_to_nostr_dms;
 use crate::payments::PaymentsByIp;
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
@@ -75,6 +75,8 @@ pub struct AppState {
     l402_config: L402Config,
     /// User management database (banned/premium/whitelisted users and domains)
     pub users_db: SqlitePool,
+    /// In-memory cache for user lists (ban/premium checks)
+    pub users_cache: Arc<UsersCache>,
     /// API token for admin endpoints
     pub admin_token: Option<String>,
     /// Pool for read queries (dashboard endpoints)
@@ -106,6 +108,7 @@ impl AppState {
         reorg_config: ReorgConfig,
         l402_config: L402Config,
         users_db: SqlitePool,
+        users_cache: Arc<UsersCache>,
         admin_token: Option<String>,
         analytics_db: Option<SqlitePool>,
         analytics_writer: Option<mpsc::UnboundedSender<analytics::AnalyticsPayment>>,
@@ -126,6 +129,7 @@ impl AppState {
             reorg_config,
             l402_config,
             users_db,
+            users_cache,
             admin_token,
             analytics_db,
             analytics_writer,
@@ -336,7 +340,7 @@ async fn github_device(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Check if user is banned
-    if auth::is_banned(&state.users_db, &primary_email.email).await {
+    if state.users_cache.is_banned(&primary_email.email).await {
         warn!("User {} is banned!", primary_email.email);
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -413,7 +417,7 @@ async fn github_callback(
         .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Check if user is banned
-    if auth::is_banned(&state.users_db, &primary_email.email).await {
+    if state.users_cache.is_banned(&primary_email.email).await {
         warn!("User {} is banned!", primary_email.email);
         return Err(StatusCode::BAD_REQUEST);
     }

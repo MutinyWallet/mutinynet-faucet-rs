@@ -32,18 +32,12 @@ pub async fn admin_list(
     Extension(state): Extension<AppState>,
     Path(list): Path<String>,
 ) -> Result<Json<AdminListResponse>, StatusCode> {
-    let (table, column) = table_and_column(&list).ok_or(StatusCode::NOT_FOUND)?;
-    let query = format!("SELECT {} FROM {} ORDER BY {}", column, table, column);
-    let rows: Vec<(String,)> = sqlx::query_as(&query)
-        .fetch_all(&state.users_db)
+    let entries = state
+        .users_cache
+        .list(&list)
         .await
-        .map_err(|e| {
-            error!("Admin DB error: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    Ok(Json(AdminListResponse {
-        entries: rows.into_iter().map(|r| r.0).collect(),
-    }))
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(AdminListResponse { entries }))
 }
 
 #[axum::debug_handler]
@@ -66,6 +60,7 @@ pub async fn admin_add(
             error!("Admin DB error: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    state.users_cache.add(&list, value.clone()).await;
     info!("Admin: added '{}' to {}", value, table);
     Ok(StatusCode::CREATED)
 }
@@ -89,6 +84,7 @@ pub async fn admin_remove(
     if result.rows_affected() == 0 {
         Err(StatusCode::NOT_FOUND)
     } else {
+        state.users_cache.remove(&list, &payload.value).await;
         info!("Admin: removed '{}' from {}", payload.value, table);
         Ok(StatusCode::OK)
     }
