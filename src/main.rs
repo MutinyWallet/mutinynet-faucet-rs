@@ -516,11 +516,21 @@ async fn lightning_handler(
 }
 
 #[axum::debug_handler]
-async fn lnurlw_handler() -> Result<Json<WithdrawalResponse>, AppError> {
+async fn lnurlw_handler(
+    Extension(state): Extension<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<WithdrawalResponse>, AppError> {
+    let x_forwarded_for = headers
+        .get("x-forwarded-for")
+        .and_then(|x| HeaderValue::to_str(x).ok())
+        .unwrap_or("Unknown");
+
+    let k1 = generate_lnurlw_k1(&state.auth.jwt_secret, x_forwarded_for);
+
     let resp = WithdrawalResponse {
         default_description: "Mutinynet Faucet".to_string(),
         callback: "https://faucet.mutinynet.com/api/lnurlw/callback".to_string(),
-        k1: "k1".to_string(),
+        k1,
         max_withdrawable: MAX_SEND_AMOUNT * 1_000,
         min_withdrawable: None,
         tag: Tag::WithdrawRequest,
@@ -541,24 +551,25 @@ async fn lnurlw_callback_handler(
     headers: HeaderMap,
     Query(payload): Query<LnurlWithdrawParams>,
 ) -> Result<Json<Value>, Json<Value>> {
-    if payload.k1 == "k1" {
-        // Extract the X-Forwarded-For header
-        let x_forwarded_for = headers
-            .get("x-forwarded-for")
-            .and_then(|x| HeaderValue::to_str(x).ok())
-            .unwrap_or("Unknown");
+    // Extract the X-Forwarded-For header
+    let x_forwarded_for = headers
+        .get("x-forwarded-for")
+        .and_then(|x| HeaderValue::to_str(x).ok())
+        .unwrap_or("Unknown");
 
-        if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT {
-            return Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})));
-        }
-
-        pay_lightning(&state, x_forwarded_for, None, &payload.pr)
-            .await
-            .map_err(|e| Json(json!({"status": "ERROR", "reason": format!("{e}")})))?;
-        Ok(Json(json!({"status": "OK"})))
-    } else {
-        Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})))
+    let expected_k1 = generate_lnurlw_k1(&state.auth.jwt_secret, x_forwarded_for);
+    if payload.k1 != expected_k1 {
+        return Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})));
     }
+
+    if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT {
+        return Err(Json(json!({"status": "ERROR", "reason": "Rate limit exceeded"})));
+    }
+
+    pay_lightning(&state, x_forwarded_for, None, &payload.pr)
+        .await
+        .map_err(|e| Json(json!({"status": "ERROR", "reason": format!("{e}")})))?;
+    Ok(Json(json!({"status": "OK"})))
 }
 
 #[derive(Serialize)]
@@ -735,6 +746,17 @@ async fn reorg_invoice_handler(
 ) -> Result<Json<ReorgInvoiceResponse>, AppError> {
     let response = generate_reorg_invoice(&state, &user, payload).await?;
     Ok(Json(response))
+}
+
+/// Generate a deterministic k1 for LNURL withdraw, binding the withdrawal to an IP identity.
+fn generate_lnurlw_k1(secret: &str, identity: &str) -> String {
+    use bitcoin::hashes::{hmac, sha256, Hash, HashEngine};
+
+    let mut engine = hmac::HmacEngine::<sha256::Hash>::new(secret.as_bytes());
+    engine.input(b"lnurlw:");
+    engine.input(identity.as_bytes());
+    let hmac = hmac::Hmac::<sha256::Hash>::from_engine(engine);
+    hex::encode(hmac.to_byte_array())
 }
 
 // Make our own error that wraps `anyhow::Error`.
