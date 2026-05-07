@@ -179,6 +179,10 @@ async fn main() -> anyhow::Result<()> {
             get(user_recent).route_layer(middleware::from_fn(auth_middleware)),
         )
         .route(
+            "/api/limits",
+            get(limits_handler).route_layer(middleware::from_fn(auth_middleware)),
+        )
+        .route(
             "/api/analytics/summary",
             get(analytics_summary).route_layer(middleware::from_fn(analytics_auth_middleware)),
         )
@@ -736,6 +740,53 @@ async fn channel_handler(
     let txid = open_channel(&state, x_forwarded_for, Some(&user), payload).await?;
 
     Ok(Json(ChannelResponse { txid }))
+}
+
+#[derive(Serialize)]
+struct LimitsResponse {
+    /// Per-identifier daily cap in sats.
+    max_daily_sats: u64,
+    /// Sats sent in the last 24h attributable to this user (across IPs).
+    user_used_sats: u64,
+    /// Sats sent in the last 24h from the requesting IP (across users).
+    ip_used_sats: u64,
+    /// Sats this user can still send before hitting the most-restrictive cap.
+    /// Always 0 until 24h have passed once a cap is reached. Premium users have no cap.
+    remaining_sats: u64,
+    /// True if the caller bypasses rate limits.
+    is_premium: bool,
+    /// Seconds in the rolling rate-limit window.
+    window_seconds: u64,
+}
+
+#[axum::debug_handler]
+async fn limits_handler(
+    Extension(state): Extension<AppState>,
+    Extension(user): Extension<AuthUser>,
+    headers: HeaderMap,
+) -> Result<Json<LimitsResponse>, AppError> {
+    let x_forwarded_for = headers
+        .get("x-forwarded-for")
+        .and_then(|x| HeaderValue::to_str(x).ok())
+        .unwrap_or("Unknown");
+
+    let (ip_used, user_used) = state.payments.get_usage(x_forwarded_for, Some(&user)).await;
+
+    let remaining = if user.is_premium {
+        MAX_SEND_AMOUNT
+    } else {
+        // The most-restrictive identifier wins (matches verify_payments).
+        MAX_SEND_AMOUNT.saturating_sub(ip_used.max(user_used))
+    };
+
+    Ok(Json(LimitsResponse {
+        max_daily_sats: MAX_SEND_AMOUNT,
+        user_used_sats: user_used,
+        ip_used_sats: ip_used,
+        remaining_sats: remaining,
+        is_premium: user.is_premium,
+        window_seconds: 86_400,
+    }))
 }
 
 #[axum::debug_handler]

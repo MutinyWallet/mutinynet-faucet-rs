@@ -95,6 +95,20 @@ impl PaymentsByIp {
         }
     }
 
+    /// Get rolling-24h usage for an IP and (optionally) a user, in a single lock acquisition.
+    pub async fn get_usage(&self, ip: &str, user: Option<&AuthUser>) -> (u64, u64) {
+        let mut trackers = self.trackers.lock().await;
+        let ip_amt = trackers
+            .get_mut(ip)
+            .map(|t| t.sum_payments())
+            .unwrap_or(0);
+        let user_amt = user
+            .and_then(|u| trackers.get_mut(format!("user:{}", u.username).as_str()))
+            .map(|t| t.sum_payments())
+            .unwrap_or(0);
+        (ip_amt, user_amt)
+    }
+
     pub async fn verify_payments(
         &self,
         ip: &str,
