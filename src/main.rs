@@ -33,6 +33,7 @@ use crate::analytics::{
     analytics_balance, analytics_combined, analytics_domains, analytics_l402, analytics_recent,
     analytics_summary, analytics_timeseries, analytics_users, user_recent,
 };
+use crate::arkade::{dispense_arkade, ArkadeRequest, ArkadeResponse};
 use crate::auth::{auth_middleware, AuthState, AuthUser, GithubCallback, UsersCache};
 use crate::nostr_dms::listen_to_nostr_dms;
 use crate::payments::PaymentsByIp;
@@ -48,6 +49,7 @@ use setup::setup;
 
 mod admin;
 mod analytics;
+mod arkade;
 mod auth;
 mod bolt11;
 mod channel;
@@ -85,6 +87,11 @@ pub struct AppState {
     pub analytics_writer: Option<mpsc::UnboundedSender<analytics::AnalyticsPayment>>,
     /// API token for analytics endpoints
     pub analytics_token: Option<String>,
+    /// Base URL of the Arkade dispenser daemon on the internal network.
+    /// If unset, POST /api/arkade returns an error.
+    pub arkade_daemon_url: Option<String>,
+    /// Optional shared secret sent to the daemon as X-Internal-Token.
+    pub arkade_internal_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -113,6 +120,8 @@ impl AppState {
         analytics_db: Option<SqlitePool>,
         analytics_writer: Option<mpsc::UnboundedSender<analytics::AnalyticsPayment>>,
         analytics_token: Option<String>,
+        arkade_daemon_url: Option<String>,
+        arkade_internal_token: Option<String>,
     ) -> Self {
         let lnurl = lnurl::Builder::default().build_async().unwrap();
         AppState {
@@ -134,6 +143,8 @@ impl AppState {
             analytics_db,
             analytics_writer,
             analytics_token,
+            arkade_daemon_url,
+            arkade_internal_token,
         }
     }
 }
@@ -169,6 +180,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/channel",
             post(channel_handler).route_layer(middleware::from_fn(auth_middleware)),
+        )
+        .route(
+            "/api/arkade",
+            post(arkade_handler).route_layer(middleware::from_fn(auth_middleware)),
         )
         .route(
             "/api/reorg/invoice",
@@ -789,6 +804,31 @@ async fn limits_handler(
         is_premium: user.is_premium,
         window_seconds: 86_400,
     }))
+}
+
+#[axum::debug_handler]
+async fn arkade_handler(
+    Extension(state): Extension<AppState>,
+    Extension(user): Extension<AuthUser>,
+    headers: HeaderMap,
+    Json(payload): Json<ArkadeRequest>,
+) -> Result<Json<ArkadeResponse>, AppError> {
+    let x_forwarded_for = headers
+        .get("x-forwarded-for")
+        .and_then(|x| HeaderValue::to_str(x).ok())
+        .unwrap_or("Unknown");
+
+    if state
+        .payments
+        .verify_payments(x_forwarded_for, None, Some(&user))
+        .await
+        && !user.is_premium
+    {
+        return Err(AppError::new("Too many payments"));
+    }
+
+    let res = dispense_arkade(&state, x_forwarded_for, &user, payload).await?;
+    Ok(Json(res))
 }
 
 #[axum::debug_handler]
