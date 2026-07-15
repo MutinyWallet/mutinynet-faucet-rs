@@ -304,6 +304,13 @@ pub async fn setup() -> anyhow::Result<AppState> {
         warn!("ANALYTICS_TOKEN not set — analytics endpoints will return 404");
     }
 
+    let arkade_daemon_url = env::var("ARKADE_DAEMON_URL").ok();
+    let arkade_internal_token = env::var("ARKADE_INTERNAL_TOKEN").ok();
+    match arkade_daemon_url.as_deref() {
+        Some(url) => info!("Arkade daemon configured at {}", url),
+        None => warn!("ARKADE_DAEMON_URL not set — /api/arkade will return an error"),
+    }
+
     Ok(AppState::new(
         host,
         keys,
@@ -321,5 +328,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
         analytics_db,
         analytics_writer,
         analytics_token,
+        arkade_daemon_url,
+        arkade_internal_token,
     ))
 }
