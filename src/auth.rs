@@ -146,10 +146,7 @@ async fn migrate_from_files(pool: &SqlitePool) {
 
         // Skip if the table already has data (already migrated)
         let query = format!("SELECT COUNT(*) FROM {}", table_name);
-        let count: (i64,) = sqlx::query_as(&query)
-            .fetch_one(pool)
-            .await
-            .unwrap_or((1,));
+        let count: (i64,) = sqlx::query_as(&query).fetch_one(pool).await.unwrap_or((1,));
         if count.0 > 0 {
             info!(
                 "Skipping migration of {} — table {} already has {} entries",
@@ -171,7 +168,10 @@ async fn migrate_from_files(pool: &SqlitePool) {
             }
         }
         let _ = tx.commit().await;
-        info!("Migrated {} entries from {} into {}", migrated, file_path, table_name);
+        info!(
+            "Migrated {} entries from {} into {}",
+            migrated, file_path, table_name
+        );
     }
 }
 

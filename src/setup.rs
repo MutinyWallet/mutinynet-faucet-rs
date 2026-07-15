@@ -267,8 +267,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
     };
 
     // Initialize users database (banned/premium/whitelisted users and domains)
-    let users_db_path =
-        env::var("USERS_DB_PATH").unwrap_or_else(|_| "users.db".to_string());
+    let users_db_path = env::var("USERS_DB_PATH").unwrap_or_else(|_| "users.db".to_string());
     let users_db = init_users_db(&users_db_path).await?;
     let users_cache = UsersCache::load(&users_db).await?;
     info!("Users database initialized at {}", users_db_path);

@@ -28,11 +28,11 @@ use tokio::sync::{mpsc, oneshot};
 use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{AllowMethods, Any, CorsLayer};
 
+use crate::admin::{admin_add, admin_list, admin_remove};
 use crate::analytics::{
     analytics_balance, analytics_combined, analytics_domains, analytics_l402, analytics_recent,
     analytics_summary, analytics_timeseries, analytics_users, user_recent,
 };
-use crate::admin::{admin_add, admin_list, admin_remove};
 use crate::auth::{auth_middleware, AuthState, AuthUser, GithubCallback, UsersCache};
 use crate::nostr_dms::listen_to_nostr_dms;
 use crate::payments::PaymentsByIp;
@@ -567,7 +567,9 @@ async fn lnurlw_callback_handler(
     }
 
     if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT {
-        return Err(Json(json!({"status": "ERROR", "reason": "Rate limit exceeded"})));
+        return Err(Json(
+            json!({"status": "ERROR", "reason": "Rate limit exceeded"}),
+        ));
     }
 
     pay_lightning(&state, x_forwarded_for, None, &payload.pr)
