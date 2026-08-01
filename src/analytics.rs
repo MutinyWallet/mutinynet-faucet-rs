@@ -191,18 +191,26 @@ pub fn record_payment(
 }
 
 /// Records an L402 invoice issuance.
+const RECORD_L402_ISSUED_SQL: &str =
+    "INSERT INTO l402_invoices (payment_hash, amount_sats) VALUES ($1, $2)
+     ON CONFLICT(payment_hash) DO UPDATE SET amount_sats = excluded.amount_sats";
+
+const RECORD_L402_PAID_SQL: &str =
+    "INSERT INTO l402_invoices (payment_hash, amount_sats, paid, paid_at)
+     VALUES ($1, 0, 1, strftime('%s', 'now'))
+     ON CONFLICT(payment_hash) DO UPDATE SET paid = 1, paid_at = strftime('%s', 'now')
+     WHERE paid = 0";
+
 pub fn record_l402_issued(pool: &SqlitePool, payment_hash: &str, amount_sats: u64) {
     let pool = pool.clone();
     let payment_hash = payment_hash.to_string();
 
     tokio::spawn(async move {
-        let result = sqlx::query(
-            "INSERT OR IGNORE INTO l402_invoices (payment_hash, amount_sats) VALUES ($1, $2)",
-        )
-        .bind(&payment_hash)
-        .bind(amount_sats as i64)
-        .execute(&pool)
-        .await;
+        let result = sqlx::query(RECORD_L402_ISSUED_SQL)
+            .bind(&payment_hash)
+            .bind(amount_sats as i64)
+            .execute(&pool)
+            .await;
 
         if let Err(e) = result {
             error!("Failed to record L402 issued: {e}");
@@ -211,17 +219,17 @@ pub fn record_l402_issued(pool: &SqlitePool, payment_hash: &str, amount_sats: u6
 }
 
 /// Marks an L402 invoice as paid. Idempotent — safe to call on every auth.
+/// Upserted so a fast payer is still recorded when this runs before
+/// record_l402_issued (both are independent tokio::spawn tasks).
 pub fn record_l402_paid(pool: &SqlitePool, payment_hash: &str) {
     let pool = pool.clone();
     let payment_hash = payment_hash.to_string();
 
     tokio::spawn(async move {
-        let result = sqlx::query(
-            "UPDATE l402_invoices SET paid = 1, paid_at = strftime('%s', 'now') WHERE payment_hash = $1 AND paid = 0",
-        )
-        .bind(&payment_hash)
-        .execute(&pool)
-        .await;
+        let result = sqlx::query(RECORD_L402_PAID_SQL)
+            .bind(&payment_hash)
+            .execute(&pool)
+            .await;
 
         if let Err(e) = result {
             error!("Failed to record L402 paid: {e}");
@@ -231,7 +239,44 @@ pub fn record_l402_paid(pool: &SqlitePool, payment_hash: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::combined_limit;
+    use super::*;
+
+    #[tokio::test]
+    async fn issued_write_repairs_paid_first_placeholder_amount() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE l402_invoices (
+                payment_hash TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                amount_sats INTEGER NOT NULL,
+                paid INTEGER NOT NULL DEFAULT 0,
+                paid_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(RECORD_L402_PAID_SQL)
+            .bind("hash")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(RECORD_L402_ISSUED_SQL)
+            .bind("hash")
+            .bind(1_000_i64)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let row: (i64, i64) =
+            sqlx::query_as("SELECT amount_sats, paid FROM l402_invoices WHERE payment_hash = ?")
+                .bind("hash")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, (1_000, 1));
+    }
 
     #[test]
     fn combined_limits_are_bounded() {
