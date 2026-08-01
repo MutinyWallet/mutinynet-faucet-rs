@@ -28,7 +28,7 @@ use std::time::Instant;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tonic_openssl_lnd::LndLightningClient;
-use tower_http::cors::{AllowMethods, Any, CorsLayer};
+use tower_http::cors::{AllowMethods, CorsLayer};
 
 use crate::admin::{admin_add, admin_list, admin_remove};
 use crate::analytics::{
@@ -255,8 +255,17 @@ async fn main() -> anyhow::Result<()> {
         .fallback(fallback)
         .layer(Extension(state.clone()))
         .layer(
+            // Only the configured frontend origin may make credentialed
+            // cross-origin requests; Any would let any website use a
+            // leaked JWT from a browser.
             CorsLayer::new()
-                .allow_origin(Any)
+                .allow_origin(
+                    state
+                        .host
+                        .trim_end_matches('/')
+                        .parse::<axum::http::HeaderValue>()
+                        .expect("HOST must be a valid origin URL"),
+                )
                 .allow_headers([axum::http::header::AUTHORIZATION])
                 .allow_methods(AllowMethods::any()),
         );
