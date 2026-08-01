@@ -4,7 +4,7 @@ CREATE TABLE IF NOT EXISTS reorgs (
     blocks INTEGER NOT NULL,
     username TEXT NOT NULL,
     created_at INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'executed', 'skipped', 'expired'
+    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'executing', 'uncertain', 'executed', 'skipped', 'expired'
     executed_at INTEGER,  -- timestamp when executed (NULL if not executed)
     invalidated_block_height INTEGER,  -- block height that was invalidated
     invalidated_block_hash TEXT  -- block hash that was invalidated

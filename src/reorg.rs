@@ -30,6 +30,28 @@ struct PendingReorg {
     username: String,
 }
 
+enum InvalidateAttempt {
+    /// No irreversible RPC was attempted, so the reservation can be released.
+    NotStarted(anyhow::Error),
+    /// `invalidateblock` was sent. An error is ambiguous because Bitcoin Core
+    /// may have applied it before the connection failed.
+    Started {
+        target_height: u64,
+        target_hash: String,
+        result: Result<()>,
+    },
+}
+
+/// Return the oldest block that must be invalidated to remove `blocks`
+/// blocks from the active tip. Never return the genesis block.
+fn reorg_target_height(current_height: u64, blocks: u8) -> Option<u64> {
+    let blocks = u64::from(blocks);
+    if blocks == 0 || current_height < blocks {
+        return None;
+    }
+    Some(current_height - blocks + 1)
+}
+
 /// Initialize the reorg database
 pub async fn init_reorg_db(db_path: &str) -> Result<SqlitePool> {
     // Create parent directories if they don't exist
@@ -43,6 +65,15 @@ pub async fn init_reorg_db(db_path: &str) -> Result<SqlitePool> {
     }
 
     let pool = SqlitePool::connect(&format!("sqlite:{}", db_path)).await?;
+
+    // WAL mode allows concurrent reads while writing; busy_timeout avoids
+    // immediate "database is locked" failures under contention.
+    sqlx::query("PRAGMA journal_mode=WAL")
+        .execute(&pool)
+        .await?;
+    sqlx::query("PRAGMA busy_timeout=5000")
+        .execute(&pool)
+        .await?;
 
     // Run schema
     let schema = include_str!("../schema.sql");
@@ -153,39 +184,6 @@ async fn update_reorg_status(
     Ok(())
 }
 
-/// Execute reorg and update cooldown in a single transaction (atomic)
-async fn execute_reorg_and_update_cooldown(
-    pool: &SqlitePool,
-    payment_hash: &str,
-    executed_at: i64,
-    invalidated_block_height: i64,
-    invalidated_block_hash: &str,
-) -> Result<()> {
-    let mut tx = pool.begin().await?;
-
-    // Update cooldown timestamp
-    sqlx::query("UPDATE reorg_cooldown SET last_reorg_timestamp = ? WHERE id = 1")
-        .bind(executed_at)
-        .execute(&mut *tx)
-        .await?;
-
-    // Update reorg status with block info
-    sqlx::query(
-        "UPDATE reorgs SET status = ?, executed_at = ?, invalidated_block_height = ?, invalidated_block_hash = ? WHERE payment_hash = ?"
-    )
-    .bind("executed")
-    .bind(Some(executed_at))
-    .bind(Some(invalidated_block_height))
-    .bind(Some(invalidated_block_hash))
-    .bind(payment_hash)
-    .execute(&mut *tx)
-    .await?;
-
-    // Commit transaction
-    tx.commit().await?;
-    Ok(())
-}
-
 /// Generate a reorg invoice (stores in DB, waits for payment via subscription)
 pub async fn generate_reorg_invoice(
     state: &AppState,
@@ -202,6 +200,11 @@ pub async fn generate_reorg_invoice(
         return Err(anyhow!("Blocks must be between 1 and 5"));
     }
 
+    // Keep the availability check, LND invoice creation, and pending-row
+    // insert in one process-wide critical section. Without this, concurrent
+    // callers can both observe no pending reorg before either row is stored.
+    let _operation_guard = state.reorg_operation_lock.lock().await;
+
     // Get pricing
     let amount_sats = state
         .reorg_config
@@ -216,6 +219,20 @@ pub async fn generate_reorg_invoice(
         .ok_or_else(|| anyhow!("Reorg database not initialized"))?;
 
     check_cooldown(pool, state.reorg_config.cooldown_seconds).await?;
+
+    // Reject new invoices while a reorg is pending or executing: only one
+    // reorg executes per cooldown window, and extra paid invoices would be
+    // marked skipped, losing the buyer's (mainnet) money.
+    let busy: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM reorgs WHERE status IN ('pending', 'executing', 'uncertain')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if busy.0 > 0 {
+        return Err(anyhow!(
+            "a reorg is already pending; try again after it executes"
+        ));
+    }
 
     // Generate invoice on mainnet LND
     let mainnet_client = state
@@ -264,8 +281,62 @@ pub async fn generate_reorg_invoice(
     })
 }
 
+/// Atomically advance the cooldown and mark the reorg as executing.
+/// Fails if the reorg is no longer pending (already handled elsewhere).
+/// Returns the previous cooldown timestamp for rollback.
+async fn reserve_reorg_execution(pool: &SqlitePool, payment_hash: &str, now: i64) -> Result<i64> {
+    let prev: (i64,) =
+        sqlx::query_as("SELECT last_reorg_timestamp FROM reorg_cooldown WHERE id = 1")
+            .fetch_one(pool)
+            .await?;
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE reorg_cooldown SET last_reorg_timestamp = ? WHERE id = 1")
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    let res = sqlx::query(
+        "UPDATE reorgs SET status = 'executing' WHERE payment_hash = ? AND status = 'pending'",
+    )
+    .bind(payment_hash)
+    .execute(&mut *tx)
+    .await?;
+    if res.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Err(anyhow!("reorg is no longer pending"));
+    }
+    tx.commit().await?;
+    Ok(prev.0)
+}
+
+/// Roll back a reserved execution when the RPC calls failed before
+/// invalidate_block, so the reorg stays pending and can be retried.
+async fn rollback_reorg_execution(
+    pool: &SqlitePool,
+    payment_hash: &str,
+    prev_cooldown: i64,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE reorg_cooldown SET last_reorg_timestamp = ? WHERE id = 1")
+        .bind(prev_cooldown)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE reorgs SET status = 'pending' WHERE payment_hash = ? AND status = 'executing'",
+    )
+    .bind(payment_hash)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Execute a reorg (internal function called when invoice is paid)
 async fn execute_reorg_internal(state: &AppState, pending_reorg: &PendingReorg) -> Result<()> {
+    // Serialize the cooldown check and irreversible RPC with invoice creation
+    // and any other execution attempt in this process.
+    let _operation_guard = state.reorg_operation_lock.lock().await;
+
     let pool = state
         .reorg_db
         .as_ref()
@@ -274,43 +345,105 @@ async fn execute_reorg_internal(state: &AppState, pending_reorg: &PendingReorg) 
     // Double-check cooldown
     check_cooldown(pool, state.reorg_config.cooldown_seconds).await?;
 
+    // Reserve the execution BEFORE the irreversible invalidate_block:
+    // advance the cooldown and mark the row as executing in one transaction.
+    // If the process crashes after invalidate_block, the row stays in
+    // 'executing' and is never re-executed (startup only scans 'pending').
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let prev_cooldown = reserve_reorg_execution(pool, &pending_reorg.payment_hash, now).await?;
+
     // Get Bitcoin Core RPC client
     let bitcoin_rpc = state
         .bitcoin_rpc
         .as_ref()
-        .ok_or_else(|| anyhow!("Bitcoin Core RPC not configured"))?;
+        .ok_or_else(|| anyhow!("Bitcoin Core RPC not configured"))?
+        .clone();
 
-    // Get current block height
-    let current_height = bitcoin_rpc.get_block_count()?;
+    // The RPC client is synchronous; keep it off the async worker threads.
+    let blocks = pending_reorg.blocks;
+    let attempt = tokio::task::spawn_blocking(move || {
+        let prepared = (|| -> Result<_> {
+            let current_height = bitcoin_rpc.get_block_count()?;
 
-    // Validate sufficient blocks exist
-    if current_height < pending_reorg.blocks as u64 {
-        return Err(anyhow!(
-            "Not enough blocks in chain to reorg. Current height: {}, requested: {}",
-            current_height,
-            pending_reorg.blocks
-        ));
-    }
+            let target_height = reorg_target_height(current_height, blocks).ok_or_else(|| {
+                anyhow!(
+                    "Not enough blocks in chain to reorg. Current height: {}, requested: {}",
+                    current_height,
+                    blocks
+                )
+            })?;
+            let target_block_hash = bitcoin_rpc.get_block_hash(target_height)?;
+            Ok((target_height, target_block_hash))
+        })();
 
-    // Calculate target height (the block to invalidate)
-    let target_height = current_height - pending_reorg.blocks as u64;
+        match prepared {
+            Err(e) => InvalidateAttempt::NotStarted(e),
+            Ok((target_height, target_block_hash)) => {
+                let target_hash = target_block_hash.to_string();
+                let result = bitcoin_rpc
+                    .invalidate_block(&target_block_hash)
+                    .map_err(anyhow::Error::from);
+                InvalidateAttempt::Started {
+                    target_height,
+                    target_hash,
+                    result,
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|e| anyhow!("reorg RPC task failed after reservation: {e}"))?;
 
-    // Get block hash at target
-    let target_block_hash = bitcoin_rpc.get_block_hash(target_height)?;
-    let target_block_hash_str = target_block_hash.to_string();
+    let (target_height, target_block_hash_str) = match attempt {
+        InvalidateAttempt::NotStarted(e) => {
+            // Preparation failed before invalidateblock was sent, so retrying
+            // is safe after restoring the reservation.
+            if let Err(re) =
+                rollback_reorg_execution(pool, &pending_reorg.payment_hash, prev_cooldown).await
+            {
+                error!("failed to roll back reorg reservation: {re}");
+            }
+            return Err(e);
+        }
+        InvalidateAttempt::Started {
+            target_height,
+            target_hash,
+            result: Ok(()),
+        } => (target_height, target_hash),
+        InvalidateAttempt::Started {
+            target_height,
+            target_hash,
+            result: Err(e),
+        } => {
+            // Do not retry an ambiguous transport/server error: Bitcoin Core
+            // may have invalidated the block before its response was lost.
+            if let Err(status_error) = update_reorg_status(
+                pool,
+                &pending_reorg.payment_hash,
+                "uncertain",
+                Some(now),
+                Some(target_height as i64),
+                Some(&target_hash),
+            )
+            .await
+            {
+                error!("failed to mark ambiguous reorg as uncertain: {status_error}");
+            }
+            return Err(anyhow!(
+                "invalidateblock result is uncertain for {target_hash}: {e}"
+            ));
+        }
+    };
 
-    // Invalidate block (triggers reorg - removes this block and all descendants)
-    bitcoin_rpc.invalidate_block(&target_block_hash)?;
-
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-
-    // Update cooldown and reorg status in a single transaction (atomic)
-    execute_reorg_and_update_cooldown(
+    // Mark the reorg as executed (cooldown was already advanced by the
+    // reservation).
+    update_reorg_status(
         pool,
         &pending_reorg.payment_hash,
-        now,
-        target_height as i64,
-        &target_block_hash_str,
+        "executed",
+        Some(now),
+        Some(target_height as i64),
+        Some(&target_block_hash_str),
     )
     .await?;
 
@@ -415,7 +548,7 @@ async fn run_invoice_listener(state: &AppState) -> Result<()> {
     // and remove all others (respects cooldown limit)
     if !settled_reorgs.is_empty() {
         // Sort by blocks descending
-        settled_reorgs.sort_by(|a, b| b.blocks.cmp(&a.blocks));
+        settled_reorgs.sort_by_key(|reorg| std::cmp::Reverse(reorg.blocks));
 
         let reorg_to_execute = &settled_reorgs[0];
 
@@ -511,4 +644,17 @@ async fn run_invoice_listener(state: &AppState) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reorg_target_height;
+
+    #[test]
+    fn targets_exact_number_of_tip_blocks() {
+        assert_eq!(reorg_target_height(100, 1), Some(100));
+        assert_eq!(reorg_target_height(100, 5), Some(96));
+        assert_eq!(reorg_target_height(4, 5), None);
+        assert_eq!(reorg_target_height(100, 0), None);
+    }
 }

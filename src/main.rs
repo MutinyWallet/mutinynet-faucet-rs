@@ -71,6 +71,9 @@ pub struct AppState {
     mainnet_lightning_client: Option<LndLightningClient>,
     bitcoin_rpc: Option<Arc<bitcoincore_rpc::Client>>,
     reorg_db: Option<SqlitePool>,
+    /// Serializes reorg invoice creation and execution so the database checks
+    /// and their external side effects cannot race within this process.
+    reorg_operation_lock: Arc<Mutex<()>>,
     payments: PaymentsByIp,
     auth: AuthState,
     reorg_config: ReorgConfig,
@@ -131,6 +134,7 @@ impl AppState {
             mainnet_lightning_client,
             bitcoin_rpc,
             reorg_db,
+            reorg_operation_lock: Arc::new(Mutex::new(())),
             payments: PaymentsByIp::new(),
             auth,
             reorg_config,
