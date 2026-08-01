@@ -97,6 +97,16 @@ impl PaymentsByIp {
         (ip_amt, user_amt)
     }
 
+    /// Drop trackers with no payments left in the rolling window, so the
+    /// map does not grow unbounded with one-off identities.
+    pub async fn prune(&self) {
+        let mut trackers = self.trackers.lock().await;
+        trackers.retain(|_, tracker| {
+            tracker.clean_old_payments();
+            !tracker.payments.is_empty()
+        });
+    }
+
     /// Atomically check the rolling-24h total for each (key, max) pair and,
     /// if none would exceed its limit, record the payment against all keys.
     /// Returns false without recording anything when any key would exceed.

@@ -257,6 +257,17 @@ async fn main() -> anyhow::Result<()> {
                 .allow_methods(AllowMethods::any()),
         );
 
+    // periodically prune empty rate-limit trackers so the map stays bounded
+    {
+        let payments = state.payments.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                payments.prune().await;
+            }
+        });
+    }
+
     // start dm listener thread
     let dm_state = state.clone();
     tokio::spawn(async move {
