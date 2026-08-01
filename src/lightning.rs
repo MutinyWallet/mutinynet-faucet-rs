@@ -15,6 +15,20 @@ use crate::auth::AuthUser;
 use crate::nostr_dms::RELAYS;
 use crate::{AppState, MAX_SEND_AMOUNT};
 
+/// Max send amount in millisatoshis (`MAX_SEND_AMOUNT` is in sats).
+const MAX_SEND_AMOUNT_MSATS: u64 = MAX_SEND_AMOUNT * 1_000;
+
+/// Reject invoices without an amount or with an amount above `max_msats`.
+fn validate_invoice_amount(invoice: &Bolt11Invoice, max_msats: u64) -> anyhow::Result<()> {
+    let msats = invoice
+        .amount_milli_satoshis()
+        .ok_or_else(|| anyhow::anyhow!("bolt11 invoice should have an amount"))?;
+    if msats > max_msats {
+        anyhow::bail!("max amount is 1,000,000");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Deserialize)]
 pub struct LightningRequest {
     pub bolt11: String,
@@ -34,25 +48,23 @@ pub async fn pay_lightning(
     let params = PaymentParams::from_str(bolt11).map_err(|_| anyhow::anyhow!("invalid bolt 11"))?;
 
     let invoice = if let Some(invoice) = params.invoice() {
-        if let Some(msat_amount) = invoice.amount_milli_satoshis() {
-            if msat_amount / 1000 > MAX_SEND_AMOUNT {
-                anyhow::bail!("max amount is 1,000,000");
-            }
-            invoice
-        } else {
-            anyhow::bail!("bolt11 invoice should have an amount");
-        }
+        validate_invoice_amount(&invoice, MAX_SEND_AMOUNT_MSATS)?;
+        invoice
     } else if let Some(lnurl) = params.lnurl() {
         match state.lnurl.make_request(&lnurl.url).await? {
             LnUrlResponse::LnUrlPayResponse(pay) => {
-                if pay.min_sendable > MAX_SEND_AMOUNT {
+                if pay.min_sendable > MAX_SEND_AMOUNT_MSATS {
                     anyhow::bail!("max amount is 1,000,000");
                 }
                 let inv = state
                     .lnurl
                     .get_invoice(&pay, pay.min_sendable, None, None)
                     .await?;
-                Bolt11Invoice::from_str(inv.invoice())?
+                let invoice = Bolt11Invoice::from_str(inv.invoice())?;
+                // A malicious LNURL server can return an invoice for a
+                // different amount than requested; never pay more than requested.
+                validate_invoice_amount(&invoice, pay.min_sendable)?;
+                invoice
             }
             _ => anyhow::bail!("invalid lnurl"),
         }
@@ -80,7 +92,7 @@ pub async fn pay_lightning(
 
         match state.lnurl.make_request(&lnurl.url).await? {
             LnUrlResponse::LnUrlPayResponse(pay) => {
-                if pay.min_sendable > MAX_SEND_AMOUNT {
+                if pay.min_sendable > MAX_SEND_AMOUNT_MSATS {
                     anyhow::bail!("max amount is 1,000,000");
                 }
 
@@ -94,7 +106,11 @@ pub async fn pay_lightning(
                     .lnurl
                     .get_invoice(&pay, pay.min_sendable, Some(zap.as_json()), None)
                     .await?;
-                Bolt11Invoice::from_str(inv.invoice())?
+                let invoice = Bolt11Invoice::from_str(inv.invoice())?;
+                // A malicious LNURL server can return an invoice for a
+                // different amount than requested; never pay more than requested.
+                validate_invoice_amount(&invoice, pay.min_sendable)?;
+                invoice
             }
             _ => anyhow::bail!("invalid lnurl"),
         }
