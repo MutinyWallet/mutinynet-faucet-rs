@@ -1718,6 +1718,7 @@ dependencies = [
  "nostr 0.29.0",
  "nostr-sdk",
  "pretty_env_logger 0.5.0",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

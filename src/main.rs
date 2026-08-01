@@ -24,8 +24,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tonic_openssl_lnd::LndLightningClient;
 use tower_http::cors::{AllowMethods, Any, CorsLayer};
 
@@ -93,6 +94,9 @@ pub struct AppState {
     pub arkade_daemon_url: Option<String>,
     /// Optional shared secret sent to the daemon as X-Internal-Token.
     pub arkade_internal_token: Option<String>,
+    /// Outstanding LNURL-withdraw k1 challenges with their creation time.
+    /// k1s are random, single-use, and expire after K1_TTL.
+    lnurlw_k1s: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 #[derive(Clone)]
@@ -146,6 +150,7 @@ impl AppState {
             analytics_token,
             arkade_daemon_url,
             arkade_internal_token,
+            lnurlw_k1s: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -157,6 +162,9 @@ const INVOICE_REQ_DAILY_LIMIT: u64 = 60;
 
 /// Daily per-IP limit for L402 status checks (clients poll this endpoint).
 const L402_CHECK_DAILY_LIMIT: u64 = 600;
+
+/// How long an LNURL-withdraw k1 stays valid.
+const K1_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -520,11 +528,16 @@ async fn lightning_handler(
 #[axum::debug_handler]
 async fn lnurlw_handler(
     Extension(state): Extension<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<WithdrawalResponse>, AppError> {
-    let x_forwarded_for = client_ip(&headers);
-
-    let k1 = generate_lnurlw_k1(&state.auth.jwt_secret, x_forwarded_for);
+    // Random, single-use k1. The old k1 was a deterministic HMAC of the
+    // client identity: it never expired and could be replayed forever.
+    let k1 = hex::encode(rand::random::<[u8; 32]>());
+    {
+        let mut k1s = state.lnurlw_k1s.lock().await;
+        // Prune expired k1s so the map does not grow unbounded.
+        k1s.retain(|_, created| created.elapsed() < K1_TTL);
+        k1s.insert(k1.clone(), Instant::now());
+    }
 
     let resp = WithdrawalResponse {
         default_description: "Mutinynet Faucet".to_string(),
@@ -553,8 +566,13 @@ async fn lnurlw_callback_handler(
     // Extract the X-Forwarded-For header
     let x_forwarded_for = client_ip(&headers);
 
-    let expected_k1 = generate_lnurlw_k1(&state.auth.jwt_secret, x_forwarded_for);
-    if payload.k1 != expected_k1 {
+    // Consume the k1: it must exist, be unexpired, and is single-use.
+    let k1_valid = {
+        let mut k1s = state.lnurlw_k1s.lock().await;
+        k1s.remove(&payload.k1)
+            .is_some_and(|created| created.elapsed() < K1_TTL)
+    };
+    if !k1_valid {
         return Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})));
     }
 
@@ -840,17 +858,6 @@ async fn reorg_invoice_handler(
 ) -> Result<Json<ReorgInvoiceResponse>, AppError> {
     let response = generate_reorg_invoice(&state, &user, payload).await?;
     Ok(Json(response))
-}
-
-/// Generate a deterministic k1 for LNURL withdraw, binding the withdrawal to an IP identity.
-fn generate_lnurlw_k1(secret: &str, identity: &str) -> String {
-    use bitcoin::hashes::{hmac, sha256, Hash, HashEngine};
-
-    let mut engine = hmac::HmacEngine::<sha256::Hash>::new(secret.as_bytes());
-    engine.input(b"lnurlw:");
-    engine.input(identity.as_bytes());
-    let hmac = hmac::Hmac::<sha256::Hash>::from_engine(engine);
-    hex::encode(hmac.to_byte_array())
 }
 
 /// Extract the client IP used for rate limiting.
