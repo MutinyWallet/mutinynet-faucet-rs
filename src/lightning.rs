@@ -4,10 +4,12 @@ use bitcoin_waila::PaymentParams;
 use lightning_invoice::Bolt11Invoice;
 use lnurl::lightning_address::LightningAddress;
 use lnurl::lnurl::LnUrl;
+use lnurl::pay::{LnURLPayInvoice, PayResponse};
 use lnurl::LnUrlResponse;
 use log::info;
 use nostr::prelude::ZapRequestData;
 use nostr::{EventBuilder, Filter, JsonUtil, Kind, Metadata, UncheckedUrl};
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
 
@@ -17,6 +19,113 @@ use crate::{AppState, MAX_SEND_AMOUNT};
 
 /// Max send amount in millisatoshis (`MAX_SEND_AMOUNT` is in sats).
 const MAX_SEND_AMOUNT_MSATS: u64 = MAX_SEND_AMOUNT * 1_000;
+
+/// Parse an LNURL fetch URL and reject unsafe schemes and IP literals.
+fn validate_fetch_url(url_str: &str) -> anyhow::Result<url::Url> {
+    let url = url::Url::from_str(url_str).map_err(|_| anyhow::anyhow!("invalid url"))?;
+
+    match url.scheme() {
+        "https" => {}
+        _ => anyhow::bail!("url must use https"),
+    }
+
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => validate_fetch_ip(IpAddr::V4(ip))?,
+        Some(url::Host::Ipv6(ip)) => validate_fetch_ip(IpAddr::V6(ip))?,
+        Some(url::Host::Domain(host)) if host.ends_with(".onion") => {
+            anyhow::bail!("onion urls require a configured proxy")
+        }
+        Some(url::Host::Domain(_)) => {}
+        None => anyhow::bail!("url must have a host"),
+    }
+
+    Ok(url)
+}
+
+fn validate_fetch_ip(ip: IpAddr) -> anyhow::Result<()> {
+    let disallowed = match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            let cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+                || octets[0] == 0
+                || octets[0] >= 240
+                || cgnat
+        }
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            let unique_local = first & 0xfe00 == 0xfc00;
+            let site_local = first & 0xffc0 == 0xfec0;
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unicast_link_local()
+                || unique_local
+                || site_local
+                || ip.to_ipv4_mapped().is_some()
+        }
+    };
+
+    if disallowed {
+        anyhow::bail!("url points at a disallowed address");
+    }
+    Ok(())
+}
+
+/// Build a client that cannot follow redirects or re-resolve a validated
+/// hostname to a different address between validation and connection.
+async fn safe_lnurl_client(url_str: &str) -> anyhow::Result<lnurl::AsyncClient> {
+    let url = validate_fetch_url(url_str)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("url must have a host"))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("url must have a known port"))?;
+
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+
+    if matches!(url.host(), Some(url::Host::Domain(_))) {
+        let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|_| anyhow::anyhow!("failed to resolve url host"))?
+            .collect();
+        if addresses.is_empty() {
+            anyhow::bail!("url host did not resolve");
+        }
+        for address in &addresses {
+            validate_fetch_ip(address.ip())?;
+        }
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+
+    Ok(lnurl::AsyncClient::from_client(builder.build()?))
+}
+
+pub(crate) async fn make_lnurl_request(url: &str) -> anyhow::Result<LnUrlResponse> {
+    Ok(safe_lnurl_client(url).await?.make_request(url).await?)
+}
+
+pub(crate) async fn get_lnurl_invoice(
+    pay: &PayResponse,
+    msats: u64,
+    zap_request: Option<String>,
+) -> anyhow::Result<LnURLPayInvoice> {
+    // The callback is supplied by the remote LNURL service and must receive
+    // the same validation and DNS pinning as the initial URL.
+    Ok(safe_lnurl_client(&pay.callback)
+        .await?
+        .get_invoice(pay, msats, zap_request, None)
+        .await?)
+}
 
 /// Reject invoices without an amount or with an amount above `max_msats`.
 fn validate_invoice_amount(invoice: &Bolt11Invoice, max_msats: u64) -> anyhow::Result<()> {
@@ -51,15 +160,12 @@ pub async fn pay_lightning(
         validate_invoice_amount(&invoice, MAX_SEND_AMOUNT_MSATS)?;
         invoice
     } else if let Some(lnurl) = params.lnurl() {
-        match state.lnurl.make_request(&lnurl.url).await? {
+        match make_lnurl_request(&lnurl.url).await? {
             LnUrlResponse::LnUrlPayResponse(pay) => {
                 if pay.min_sendable > MAX_SEND_AMOUNT_MSATS {
                     anyhow::bail!("max amount is 1,000,000");
                 }
-                let inv = state
-                    .lnurl
-                    .get_invoice(&pay, pay.min_sendable, None, None)
-                    .await?;
+                let inv = get_lnurl_invoice(&pay, pay.min_sendable, None).await?;
                 let invoice = Bolt11Invoice::from_str(inv.invoice())?;
                 // A malicious LNURL server can return an invoice for a
                 // different amount than requested; never pay more than requested.
@@ -90,7 +196,7 @@ pub async fn pay_lightning(
             .or(metadata.lud06.and_then(|l| LnUrl::decode(l).ok()))
             .ok_or(anyhow::anyhow!("no lnurl"))?;
 
-        match state.lnurl.make_request(&lnurl.url).await? {
+        match make_lnurl_request(&lnurl.url).await? {
             LnUrlResponse::LnUrlPayResponse(pay) => {
                 if pay.min_sendable > MAX_SEND_AMOUNT_MSATS {
                     anyhow::bail!("max amount is 1,000,000");
@@ -102,10 +208,7 @@ pub async fn pay_lightning(
                     .amount(pay.min_sendable);
                 let zap = EventBuilder::public_zap_request(zap_data).to_event(&state.keys)?;
 
-                let inv = state
-                    .lnurl
-                    .get_invoice(&pay, pay.min_sendable, Some(zap.as_json()), None)
-                    .await?;
+                let inv = get_lnurl_invoice(&pay, pay.min_sendable, Some(zap.as_json())).await?;
                 let invoice = Bolt11Invoice::from_str(inv.invoice())?;
                 // A malicious LNURL server can return an invoice for a
                 // different amount than requested; never pay more than requested.
@@ -179,4 +282,22 @@ pub async fn pay_lightning(
     }
 
     Ok(hex::encode(payment_preimage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_https_and_private_ip_literals() {
+        assert!(validate_fetch_url("http://example.com/lnurl").is_err());
+        assert!(validate_fetch_url("https://127.0.0.1/lnurl").is_err());
+        assert!(validate_fetch_url("https://[::1]/lnurl").is_err());
+        assert!(validate_fetch_url("https://[fe80::1]/lnurl").is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_hostnames_that_resolve_to_private_addresses() {
+        assert!(safe_lnurl_client("https://localhost/lnurl").await.is_err());
+    }
 }

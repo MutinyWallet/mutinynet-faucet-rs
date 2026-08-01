@@ -1725,6 +1725,7 @@ dependencies = [
  "tokio",
  "tonic_openssl_lnd",
  "tower-http 0.4.3",
+ "url",
 ]
 
 [[package]]

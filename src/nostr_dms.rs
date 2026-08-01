@@ -149,7 +149,7 @@ async fn get_invoice(
     pubkey: nostr::PublicKey,
     state: &AppState,
 ) -> anyhow::Result<Bolt11Invoice> {
-    let invoice = match state.lnurl.make_request(&lnurl.url).await? {
+    let invoice = match crate::lightning::make_lnurl_request(&lnurl.url).await? {
         LnUrlResponse::LnUrlPayResponse(pay) => {
             let amount_msats = pay.min_sendable * 2;
             if amount_msats > MAX_SEND_AMOUNT {
@@ -163,9 +163,7 @@ async fn get_invoice(
                 .message("This is a private zap 👻");
             let zap = nips::nip57::private_zap_request(zap_data, &state.keys)?;
 
-            let inv = state
-                .lnurl
-                .get_invoice(&pay, amount_msats, Some(zap.as_json()), None)
+            let inv = crate::lightning::get_lnurl_invoice(&pay, amount_msats, Some(zap.as_json()))
                 .await?;
             Bolt11Invoice::from_str(inv.invoice())?
         }
