@@ -1,6 +1,12 @@
+.git
 .gitignore
 .github
+/target
 *.md
+*.db
+*.db-shm
+*.db-wal
 justfile
 .env.local
 .env
+/faucet_config

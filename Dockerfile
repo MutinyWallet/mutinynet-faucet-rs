@@ -1,4 +1,4 @@
-FROM rust:1.85.0 AS builder
+FROM rust:1.88.0 AS builder
 
 # Install build dependencies
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -17,7 +17,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo 'fn main() {}' > src/main.rs
 
 # Build dependencies (this layer is cached unless Cargo.toml/Cargo.lock change)
-RUN cargo build --release && rm -rf src
+RUN cargo build --release --locked && rm -rf src
 
 # Copy actual source code
 COPY . .
@@ -26,6 +26,25 @@ COPY . .
 RUN touch src/main.rs
 
 # Build the application (only recompiles our crate, not dependencies)
-RUN cargo build --release
+RUN cargo build --release --locked
 
-ENTRYPOINT ["/bin/bash", "-c", "./target/release/mutinynet-faucet-rs ${FLAGS}"]
+
+FROM debian:bookworm-slim
+
+# Runtime dependencies: TLS for reqwest/LND clients, certificates for HTTPS
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home /app faucet \
+    && mkdir -p /app \
+    && chown faucet:faucet /app
+
+COPY --from=builder /app/target/release/mutinynet-faucet-rs /usr/local/bin/mutinynet-faucet-rs
+
+# Keep the historical working directory so existing /app volumes and the
+# default relative SQLite paths continue to work across image upgrades.
+WORKDIR /app
+USER faucet
+
+ENTRYPOINT ["/usr/local/bin/mutinynet-faucet-rs"]
