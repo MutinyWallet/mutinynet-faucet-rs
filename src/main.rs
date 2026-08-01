@@ -472,7 +472,7 @@ async fn github_device(
     // Create JWT
     let claims = auth::TokenClaims {
         sub: primary_email.email,
-        exp: (chrono::Utc::now() + chrono::Duration::days(31)).timestamp() as usize,
+        exp: (chrono::Utc::now() + chrono::Duration::hours(24)).timestamp() as usize,
         iat: chrono::Utc::now().timestamp() as usize,
     };
 
