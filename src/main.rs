@@ -263,10 +263,13 @@ async fn main() -> anyhow::Result<()> {
     // start dm listener thread
     let dm_state = state.clone();
     tokio::spawn(async move {
+        let mut backoff = std::time::Duration::from_secs(1);
         loop {
             if let Err(e) = listen_to_nostr_dms(dm_state.clone()).await {
                 error!("Error listening to nostr dms: {e}");
             }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(300));
         }
     });
 

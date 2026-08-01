@@ -23,6 +23,9 @@ const NOSTR_DM_GLOBAL_KEY: &str = "nostr_dm";
 const NOSTR_DM_DAILY_LIMIT: u64 = 10 * MAX_SEND_AMOUNT;
 
 pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
+    // Reconnect with exponential backoff (reset whenever events flow) so a
+    // relay outage or IP ban does not turn into a hot reconnect loop.
+    let mut backoff = std::time::Duration::from_secs(1);
     loop {
         let client = Client::new(&state.keys);
         client.add_relays(RELAYS).await?;
@@ -38,6 +41,7 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
         let mut notifications = client.notifications();
 
         while let Ok(notification) = notifications.recv().await {
+            backoff = std::time::Duration::from_secs(1);
             match notification {
                 RelayPoolNotification::Event { event, .. } => {
                     if event.kind == Kind::EncryptedDirectMessage {
@@ -63,6 +67,10 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
                 RelayPoolNotification::RelayStatus { .. } => {}
             }
         }
+
+        warn!("nostr relay connection closed; reconnecting in {backoff:?}");
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(300));
     }
 }
 
