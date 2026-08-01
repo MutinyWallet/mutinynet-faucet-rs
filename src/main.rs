@@ -12,6 +12,7 @@ use axum::{
 };
 use bitcoin_waila::PaymentParams;
 use jsonwebtoken::{encode, EncodingKey, Header};
+use lightning_invoice::Bolt11Invoice;
 use lnurl::withdraw::WithdrawalResponse;
 use lnurl::{AsyncClient, Tag};
 use log::{error, info, warn};
@@ -579,6 +580,15 @@ async fn lnurlw_callback_handler(
     let expected_k1 = generate_lnurlw_k1(&state.auth.jwt_secret, x_forwarded_for);
     if payload.k1 != expected_k1 {
         return Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})));
+    }
+
+    // Only accept bolt11 invoices. pay_lightning also resolves LNURLs and
+    // lightning addresses, which would let an unauthenticated caller make
+    // the server fetch invoices from (and send requests to) arbitrary servers.
+    if Bolt11Invoice::from_str(&payload.pr).is_err() {
+        return Err(Json(
+            json!({"status": "ERROR", "reason": "pr must be a bolt11 invoice"}),
+        ));
     }
 
     if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT {
