@@ -152,6 +152,12 @@ impl AppState {
 
 const MAX_SEND_AMOUNT: u64 = 1_000_000;
 
+/// Daily per-IP limit for unauthenticated invoice creation endpoints.
+const INVOICE_REQ_DAILY_LIMIT: u64 = 60;
+
+/// Daily per-IP limit for L402 status checks (clients poll this endpoint).
+const L402_CHECK_DAILY_LIMIT: u64 = 600;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let state = setup().await?;
@@ -610,7 +616,19 @@ async fn generate_l402_challenge(state: &AppState) -> Result<L402HandlerResponse
 #[axum::debug_handler]
 async fn l402_challenge_handler(
     Extension(state): Extension<AppState>,
+    headers: HeaderMap,
 ) -> Result<Response, AppError> {
+    // Unauthenticated invoice creation is rate-limited per IP to protect
+    // the (mainnet) LND node from invoice spam.
+    let key = format!("l402:{}", client_ip(&headers));
+    if !state
+        .payments
+        .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
+        .await
+    {
+        return Err(AppError::new("Too many requests"));
+    }
+
     let challenge = generate_l402_challenge(&state).await?;
 
     let www_auth = format!(
@@ -632,7 +650,17 @@ async fn l402_challenge_handler(
 #[axum::debug_handler]
 async fn l402_handler(
     Extension(state): Extension<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<L402HandlerResponse>, AppError> {
+    let key = format!("l402:{}", client_ip(&headers));
+    if !state
+        .payments
+        .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
+        .await
+    {
+        return Err(AppError::new("Too many requests"));
+    }
+
     let challenge = generate_l402_challenge(&state).await?;
     Ok(Json(challenge))
 }
@@ -645,10 +673,21 @@ struct L402CheckParams {
 #[axum::debug_handler]
 async fn l402_check_handler(
     Extension(state): Extension<AppState>,
+    headers: HeaderMap,
     Query(params): Query<L402CheckParams>,
 ) -> Result<Json<Value>, AppError> {
     if !state.l402_config.enabled {
         return Err(AppError::new("L402 authentication is not enabled"));
+    }
+
+    // Each check hits LND lookup_invoice; rate-limit per IP.
+    let key = format!("l402check:{}", client_ip(&headers));
+    if !state
+        .payments
+        .try_reserve(&[(&key, L402_CHECK_DAILY_LIMIT)], 1)
+        .await
+    {
+        return Err(AppError::new("Too many requests"));
     }
 
     let mainnet_client = state
@@ -700,8 +739,20 @@ async fn l402_check_handler(
 #[axum::debug_handler]
 async fn bolt11_handler(
     Extension(state): Extension<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<Bolt11Request>,
 ) -> Result<Json<Bolt11Response>, AppError> {
+    // Unauthenticated invoice creation is rate-limited per IP to protect
+    // the LND node from invoice spam.
+    let key = format!("bolt11:{}", client_ip(&headers));
+    if !state
+        .payments
+        .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
+        .await
+    {
+        return Err(AppError::new("Too many requests"));
+    }
+
     let bolt11 = request_bolt11(&state, payload.clone()).await?;
 
     Ok(Json(Bolt11Response { bolt11 }))
