@@ -15,9 +15,9 @@ use crate::{AppState, ReorgConfig};
 
 pub async fn setup() -> anyhow::Result<AppState> {
     // Load environment variables from various sources.
-    dotenv::from_filename(".env.local").ok();
-    dotenv::from_filename(".env").ok();
-    dotenv::dotenv().ok();
+    dotenvy::from_filename(".env.local").ok();
+    dotenvy::from_filename(".env").ok();
+    dotenvy::dotenv().ok();
     // log env logger after dotenv
     pretty_env_logger::try_init()?;
 
@@ -41,7 +41,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
 
     // read keys from env, otherwise generate one
     let keys = env::var("NSEC")
-        .map(|k| Keys::parse(k).expect("Invalid nsec"))
+        .map(|k| Keys::parse(&k).expect("Invalid nsec"))
         .unwrap_or(Keys::generate());
 
     let network = env::var("NETWORK").expect("missing NETWORK");

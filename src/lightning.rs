@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-use bitcoin_waila::PaymentParams;
 use lightning_invoice::Bolt11Invoice;
 use lnurl::lightning_address::LightningAddress;
 use lnurl::lnurl::LnUrl;
@@ -8,13 +7,14 @@ use lnurl::pay::{LnURLPayInvoice, PayResponse};
 use lnurl::LnUrlResponse;
 use log::info;
 use nostr::prelude::ZapRequestData;
-use nostr::{EventBuilder, Filter, JsonUtil, Kind, Metadata, UncheckedUrl};
+use nostr::{EventBuilder, Filter, JsonUtil, Kind, Metadata, RelayUrl};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
 
 use crate::auth::AuthUser;
 use crate::nostr_dms::RELAYS;
+use crate::payment_instructions::parse_payment_instructions;
 use crate::{AppState, MAX_SEND_AMOUNT};
 
 /// Max send amount in millisatoshis (`MAX_SEND_AMOUNT` is in sats).
@@ -128,14 +128,39 @@ pub(crate) async fn get_lnurl_invoice(
 }
 
 /// Reject invoices without an amount or with an amount above `max_msats`.
-fn validate_invoice_amount(invoice: &Bolt11Invoice, max_msats: u64) -> anyhow::Result<()> {
+pub(crate) fn validate_invoice_amount(
+    invoice: &Bolt11Invoice,
+    max_msats: u64,
+) -> anyhow::Result<()> {
     let msats = invoice
         .amount_milli_satoshis()
         .ok_or_else(|| anyhow::anyhow!("bolt11 invoice should have an amount"))?;
-    if msats > max_msats {
+    if msats == 0 || msats > max_msats {
         anyhow::bail!("max amount is 1,000,000");
     }
     Ok(())
+}
+
+fn validate_lnurl_invoice_amount(
+    invoice: &Bolt11Invoice,
+    requested_msats: u64,
+) -> anyhow::Result<()> {
+    validate_invoice_amount(invoice, requested_msats)?;
+    if invoice.amount_milli_satoshis() != Some(requested_msats) {
+        anyhow::bail!("LNURL invoice amount does not match the requested amount");
+    }
+    Ok(())
+}
+
+fn msats_to_limit_sats(msats: u64) -> u64 {
+    msats.div_ceil(1_000)
+}
+
+pub(crate) fn invoice_amount_sats(invoice: &Bolt11Invoice) -> anyhow::Result<u64> {
+    invoice
+        .amount_milli_satoshis()
+        .map(msats_to_limit_sats)
+        .ok_or_else(|| anyhow::anyhow!("bolt11 invoice should have an amount"))
 }
 
 #[derive(Clone, Deserialize)]
@@ -154,37 +179,52 @@ pub async fn pay_lightning(
     user: Option<&AuthUser>,
     bolt11: &str,
 ) -> anyhow::Result<String> {
-    let params = PaymentParams::from_str(bolt11).map_err(|_| anyhow::anyhow!("invalid bolt 11"))?;
+    let params = parse_payment_instructions(bolt11, state.network).await.ok();
 
-    let invoice = if let Some(invoice) = params.invoice() {
+    let lnurl_target = bolt11
+        .strip_prefix("lightning:")
+        .or_else(|| bolt11.strip_prefix("LIGHTNING:"))
+        .unwrap_or(bolt11);
+    let lnurl = LnUrl::decode(lnurl_target.to_owned()).ok().or_else(|| {
+        LightningAddress::from_str(lnurl_target)
+            .ok()
+            .map(|address| address.lnurl())
+    });
+
+    let invoice = if let Some(invoice) = params.and_then(|params| params.invoice) {
         validate_invoice_amount(&invoice, MAX_SEND_AMOUNT_MSATS)?;
         invoice
-    } else if let Some(lnurl) = params.lnurl() {
+    } else if let Some(lnurl) = lnurl {
         match make_lnurl_request(&lnurl.url).await? {
             LnUrlResponse::LnUrlPayResponse(pay) => {
                 if pay.min_sendable > MAX_SEND_AMOUNT_MSATS {
                     anyhow::bail!("max amount is 1,000,000");
                 }
                 let inv = get_lnurl_invoice(&pay, pay.min_sendable, None).await?;
-                let invoice = Bolt11Invoice::from_str(inv.invoice())?;
+                let invoice = Bolt11Invoice::from_str(inv.invoice())
+                    .map_err(|error| anyhow::anyhow!("invalid invoice: {error:?}"))?;
                 // A malicious LNURL server can return an invoice for a
                 // different amount than requested; never pay more than requested.
-                validate_invoice_amount(&invoice, pay.min_sendable)?;
+                validate_lnurl_invoice_amount(&invoice, pay.min_sendable)?;
                 invoice
             }
             _ => anyhow::bail!("invalid lnurl"),
         }
-    } else if let Some(npub) = params.nostr_pubkey() {
+    } else if let Ok(npub) = nostr::PublicKey::parse(
+        bolt11
+            .strip_prefix("nostr:")
+            .or_else(|| bolt11.strip_prefix("NOSTR:"))
+            .unwrap_or(bolt11),
+    ) {
         let client = nostr_sdk::Client::default();
-        client.add_relays(RELAYS).await?;
+        for relay in RELAYS {
+            client.add_relay(relay).await?;
+        }
         client.connect().await;
 
-        let filter = Filter::new()
-            .author(npub.into())
-            .kind(Kind::Metadata)
-            .limit(1);
+        let filter = Filter::new().author(npub).kind(Kind::Metadata).limit(1);
         let events = client
-            .get_events_of(vec![filter], Some(std::time::Duration::from_secs(10)))
+            .fetch_events(filter, std::time::Duration::from_secs(10))
             .await?;
         let event = events
             .into_iter()
@@ -204,17 +244,21 @@ pub async fn pay_lightning(
                     anyhow::bail!("max amount is 1,000,000");
                 }
 
-                let relays = RELAYS.iter().map(|r| UncheckedUrl::new(*r));
-                let zap_data = ZapRequestData::new(npub.into(), relays)
+                let relays = RELAYS
+                    .iter()
+                    .map(|relay| RelayUrl::parse(relay))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let zap_data = ZapRequestData::new(npub, relays)
                     .lnurl(lnurl.encode())
                     .amount(pay.min_sendable);
-                let zap = EventBuilder::public_zap_request(zap_data).to_event(&state.keys)?;
+                let zap = EventBuilder::public_zap_request(zap_data).sign_with_keys(&state.keys)?;
 
                 let inv = get_lnurl_invoice(&pay, pay.min_sendable, Some(zap.as_json())).await?;
-                let invoice = Bolt11Invoice::from_str(inv.invoice())?;
+                let invoice = Bolt11Invoice::from_str(inv.invoice())
+                    .map_err(|error| anyhow::anyhow!("invalid invoice: {error:?}"))?;
                 // A malicious LNURL server can return an invoice for a
                 // different amount than requested; never pay more than requested.
-                validate_invoice_amount(&invoice, pay.min_sendable)?;
+                validate_lnurl_invoice_amount(&invoice, pay.min_sendable)?;
                 invoice
             }
             _ => anyhow::bail!("invalid lnurl"),
@@ -228,7 +272,7 @@ pub async fn pay_lightning(
 
         info!("Paying invoice {}", invoice.payment_hash());
 
-        let amount_sats = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
+        let amount_sats = invoice_amount_sats(&invoice)?;
 
         // Atomically check the limits and record the payment before paying.
         // Premium users bypass the limit but are still tracked.
@@ -304,5 +348,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_hostnames_that_resolve_to_private_addresses() {
         assert!(safe_lnurl_client("https://localhost/lnurl").await.is_err());
+    }
+
+    #[test]
+    fn rounds_millisatoshis_up_for_rate_limits() {
+        assert_eq!(msats_to_limit_sats(0), 0);
+        assert_eq!(msats_to_limit_sats(1), 1);
+        assert_eq!(msats_to_limit_sats(999), 1);
+        assert_eq!(msats_to_limit_sats(1_000), 1);
+        assert_eq!(msats_to_limit_sats(1_001), 2);
     }
 }

@@ -2,6 +2,7 @@
 name = "mutinynet-faucet-rs"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -9,25 +10,25 @@ edition = "2021"
 async-trait = "0.1"
 anyhow = "1.0.70"
 axum = { version = "0.6.20", features = ["macros", "headers"] }
-bitcoin-waila = "0.3.0"
+bitcoin-payment-instructions = "0.7.1"
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tonic_openssl_lnd = "0.2.0"
-dotenv = "0.15.0"
-lnurl-rs = "0.4.0"
+dotenvy = "0.15.7"
+lnurl-rs = { version = "0.10.0", default-features = false, features = ["async-https-native"] }
 hex = "0.4.3"
-bitcoin = "0.30.2"
-lightning-invoice = "0.27.0"
+bitcoin = "0.32.7"
+lightning-invoice = "0.34.0"
 tower-http = { version = "0.4.0", features = ["cors"] }
 log = "0.4.20"
 pretty_env_logger = "0.5.0"
-nostr = "0.29.0"
-nostr-sdk = "0.29.0"
+nostr = { version = "0.44", features = ["nip04", "nip57"] }
+nostr-sdk = { version = "0.44.1", features = ["nip04", "nip57"] }
 url = "2.5.0"
 jsonwebtoken = "9.3.0"
 rand = "0.8"
-reqwest = "0.11.23"
+reqwest = "0.12.23"
 chrono = "0.4.39"
 bitcoincore-rpc = "0.18.0"
-sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "sqlite"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-native-tls", "sqlite"] }

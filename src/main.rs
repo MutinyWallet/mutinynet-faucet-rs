@@ -10,7 +10,6 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-use bitcoin_waila::PaymentParams;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use lightning_invoice::Bolt11Invoice;
 use lnurl::withdraw::WithdrawalResponse;
@@ -24,7 +23,6 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tonic_openssl_lnd::LndLightningClient;
@@ -59,6 +57,7 @@ mod l402;
 mod lightning;
 mod nostr_dms;
 mod onchain;
+mod payment_instructions;
 mod payments;
 mod reorg;
 mod setup;
@@ -93,12 +92,6 @@ pub struct AppState {
     pub arkade_daemon_url: Option<String>,
     /// Optional shared secret sent to the daemon as X-Internal-Token.
     pub arkade_internal_token: Option<String>,
-    /// Outstanding LNURL-withdraw k1 challenges with their creation time.
-    /// k1s are random, single-use, and expire after CHALLENGE_TTL.
-    lnurlw_k1s: Arc<Mutex<HashMap<String, Instant>>>,
-    /// Outstanding OAuth state parameters with their creation time
-    /// (login CSRF protection).
-    oauth_states: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 #[derive(Clone)]
@@ -150,8 +143,6 @@ impl AppState {
             analytics_token,
             arkade_daemon_url,
             arkade_internal_token,
-            lnurlw_k1s: Arc::new(Mutex::new(HashMap::new())),
-            oauth_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -166,6 +157,9 @@ const L402_CHECK_DAILY_LIMIT: u64 = 600;
 
 /// How long a challenge (LNURL-withdraw k1, OAuth state) stays valid.
 const CHALLENGE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Hard cap for outstanding LNURL-withdraw challenges in persistent storage.
+const MAX_OUTSTANDING_LNURLW_CHALLENGES: i64 = 10_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -379,11 +373,6 @@ async fn github_auth(Extension(state): Extension<AppState>) -> Result<Response, 
     // CSRF (an attacker tricking a victim's browser into completing the
     // attacker's own OAuth flow).
     let oauth_state = hex::encode(rand::random::<[u8; 16]>());
-    {
-        let mut states = state.oauth_states.lock().await;
-        states.retain(|_, created| created.elapsed() < CHALLENGE_TTL);
-        states.insert(oauth_state.clone(), Instant::now());
-    }
 
     let redirect_url = format!(
         "https://github.com/login/oauth/authorize?client_id={}&scope=user:email&redirect_uri={}/auth/github/callback&state={}",
@@ -499,17 +488,12 @@ async fn github_callback(
     Extension(state): Extension<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    // Validate the OAuth state parameter (single-use, 10-minute TTL).
+    // Validate the OAuth state parameter against the 10-minute HttpOnly cookie.
     let state_valid = match (
         params.state.as_deref(),
         cookie_value(&headers, OAUTH_STATE_COOKIE),
     ) {
-        (Some(s), Some(cookie_state)) if ct_eq(s, cookie_state) => {
-            let mut states = state.oauth_states.lock().await;
-            states
-                .remove(s)
-                .is_some_and(|created| created.elapsed() < CHALLENGE_TTL)
-        }
+        (Some(s), Some(cookie_state)) => ct_eq(s, cookie_state),
         _ => false,
     };
     if !state_valid {
@@ -614,10 +598,6 @@ async fn onchain_handler(
     // Extract the X-Forwarded-For header
     let x_forwarded_for = client_ip(&headers);
 
-    let params = PaymentParams::from_str(&payload.address)
-        .map_err(|_| anyhow::anyhow!("invalid address"))?;
-    let _address_str = params.address().ok_or(anyhow::anyhow!("invalid address"))?;
-
     let res = pay_onchain(&state, x_forwarded_for, user, payload).await?;
 
     Ok(Json(res))
@@ -641,15 +621,37 @@ async fn lightning_handler(
 #[axum::debug_handler]
 async fn lnurlw_handler(
     Extension(state): Extension<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<WithdrawalResponse>, AppError> {
+    let key = format!("lnurlw:{}", client_ip(&headers));
+    if !state
+        .payments
+        .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
+        .await
+    {
+        return Err(AppError::new("Too many requests"));
+    }
+
     // Random, single-use k1. The old k1 was a deterministic HMAC of the
     // client identity: it never expired and could be replayed forever.
     let k1 = hex::encode(rand::random::<[u8; 32]>());
-    {
-        let mut k1s = state.lnurlw_k1s.lock().await;
-        // Prune expired k1s so the map does not grow unbounded.
-        k1s.retain(|_, created| created.elapsed() < CHALLENGE_TTL);
-        k1s.insert(k1.clone(), Instant::now());
+    let now = chrono::Utc::now().timestamp();
+    let cutoff = now - CHALLENGE_TTL.as_secs() as i64;
+    sqlx::query("DELETE FROM lnurlw_challenges WHERE created_at <= ?")
+        .bind(cutoff)
+        .execute(&state.users_db)
+        .await?;
+    let inserted = sqlx::query(
+        "INSERT INTO lnurlw_challenges (k1, created_at)
+         SELECT ?, ? WHERE (SELECT COUNT(*) FROM lnurlw_challenges) < ?",
+    )
+    .bind(&k1)
+    .bind(now)
+    .bind(MAX_OUTSTANDING_LNURLW_CHALLENGES)
+    .execute(&state.users_db)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(AppError::new("Too many outstanding withdrawal requests"));
     }
 
     let resp = WithdrawalResponse {
@@ -680,11 +682,13 @@ async fn lnurlw_callback_handler(
     let x_forwarded_for = client_ip(&headers);
 
     // Consume the k1: it must exist, be unexpired, and is single-use.
-    let k1_valid = {
-        let mut k1s = state.lnurlw_k1s.lock().await;
-        k1s.remove(&payload.k1)
-            .is_some_and(|created| created.elapsed() < CHALLENGE_TTL)
-    };
+    let cutoff = chrono::Utc::now().timestamp() - CHALLENGE_TTL.as_secs() as i64;
+    let k1_valid = sqlx::query("DELETE FROM lnurlw_challenges WHERE k1 = ? AND created_at > ?")
+        .bind(&payload.k1)
+        .bind(cutoff)
+        .execute(&state.users_db)
+        .await
+        .is_ok_and(|result| result.rows_affected() == 1);
     if !k1_valid {
         return Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})));
     }

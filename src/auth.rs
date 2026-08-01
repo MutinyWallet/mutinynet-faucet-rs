@@ -109,6 +109,15 @@ pub async fn init_users_db(path: &str) -> anyhow::Result<SqlitePool> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS lnurlw_challenges (
+            k1 TEXT PRIMARY KEY NOT NULL,
+            created_at INTEGER NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // Migrate from text files if tables are empty and files exist
     migrate_from_files(&pool).await;
     normalize_user_values(&pool).await?;

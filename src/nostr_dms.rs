@@ -1,6 +1,7 @@
+use crate::lightning::{invoice_amount_sats, validate_invoice_amount};
+use crate::payment_instructions::parse_payment_instructions;
 use crate::{AppState, MAX_SEND_AMOUNT};
 use bitcoin::Amount;
-use bitcoin_waila::PaymentParams;
 use lightning_invoice::Bolt11Invoice;
 use lnurl::lightning_address::LightningAddress;
 use lnurl::lnurl::LnUrl;
@@ -8,7 +9,7 @@ use lnurl::LnUrlResponse;
 use log::{error, info, warn};
 use nostr::nips::nip04;
 use nostr::prelude::ZapRequestData;
-use nostr::{nips, Event, Filter, JsonUtil, Kind, Metadata, Timestamp, UncheckedUrl};
+use nostr::{nips, Event, Filter, JsonUtil, Kind, Metadata, RelayUrl, Timestamp};
 use nostr_sdk::{Client, RelayPoolNotification};
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
@@ -27,8 +28,10 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
     // relay outage or IP ban does not turn into a hot reconnect loop.
     let mut backoff = std::time::Duration::from_secs(1);
     loop {
-        let client = Client::new(&state.keys);
-        client.add_relays(RELAYS).await?;
+        let client = Client::new(state.keys.clone());
+        for relay in RELAYS {
+            client.add_relay(relay).await?;
+        }
         client.connect().await;
 
         let filter = Filter::new()
@@ -36,7 +39,7 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
             .kind(Kind::EncryptedDirectMessage)
             .since(Timestamp::now());
 
-        client.subscribe(vec![filter], None).await;
+        client.subscribe(filter, None).await?;
 
         let mut notifications = client.notifications();
 
@@ -62,9 +65,7 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
                     warn!("Relay pool shutdown");
                     break;
                 }
-                RelayPoolNotification::Stop => {}
                 RelayPoolNotification::Message { .. } => {}
-                RelayPoolNotification::RelayStatus { .. } => {}
             }
         }
 
@@ -79,82 +80,77 @@ async fn pay_invoice(
     state: &AppState,
     nostr_pubkey: &str,
 ) -> anyhow::Result<()> {
-    // only pay if invoice has a valid amount
-    if invoice
-        .amount_milli_satoshis()
-        .is_some_and(|amt| amt / 1_000 < MAX_SEND_AMOUNT)
-    {
-        let amount_sats = invoice.amount_milli_satoshis().unwrap_or(0) / 1_000;
+    validate_invoice_amount(&invoice, MAX_SEND_AMOUNT * 1_000)?;
+    let amount_sats = invoice_amount_sats(&invoice)?;
 
-        // Rate-limit DM payments: per-pubkey and against the global DM
-        // budget, since nostr keys are free to mint. Atomic check-and-record.
-        let keys = [
-            (nostr_pubkey, MAX_SEND_AMOUNT),
-            (NOSTR_DM_GLOBAL_KEY, NOSTR_DM_DAILY_LIMIT),
-        ];
-        if !state.payments.try_reserve(&keys, amount_sats).await {
-            anyhow::bail!("Too many payments");
-        }
-
-        info!("Paying invoice {} from nostr dm", invoice.payment_hash());
-        let mut lightning_client = state.lightning_client.clone();
-
-        let payment_result = async {
-            let response = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                lightning_client.send_payment_sync(lnrpc::SendRequest {
-                    payment_request: invoice.to_string(),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("payment timed out"))??
-            .into_inner();
-
-            if !response.payment_error.is_empty() {
-                anyhow::bail!("Payment error: {}", response.payment_error);
-            }
-            Ok::<_, anyhow::Error>(response)
-        }
-        .await;
-
-        if let Err(e) = payment_result {
-            state.payments.release(&keys, amount_sats).await;
-            return Err(e);
-        }
-
-        if let Some(tx) = &state.analytics_writer {
-            crate::analytics::record_payment(
-                tx,
-                "nostr_dm",
-                invoice.amount_milli_satoshis().unwrap_or(0) / 1000,
-                Some(nostr_pubkey),
-                nostr_pubkey,
-                Some(&invoice.to_string()),
-            );
-        }
-
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Invalid invoice amount"))
+    // Rate-limit DM payments: per-pubkey and against the global DM
+    // budget, since nostr keys are free to mint. Atomic check-and-record.
+    let keys = [
+        (nostr_pubkey, MAX_SEND_AMOUNT),
+        (NOSTR_DM_GLOBAL_KEY, NOSTR_DM_DAILY_LIMIT),
+    ];
+    if !state.payments.try_reserve(&keys, amount_sats).await {
+        anyhow::bail!("Too many payments");
     }
+
+    info!("Paying invoice {} from nostr dm", invoice.payment_hash());
+    let mut lightning_client = state.lightning_client.clone();
+
+    let payment_result = async {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            lightning_client.send_payment_sync(lnrpc::SendRequest {
+                payment_request: invoice.to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("payment timed out"))??
+        .into_inner();
+
+        if !response.payment_error.is_empty() {
+            anyhow::bail!("Payment error: {}", response.payment_error);
+        }
+        Ok::<_, anyhow::Error>(response)
+    }
+    .await;
+
+    if let Err(e) = payment_result {
+        state.payments.release(&keys, amount_sats).await;
+        return Err(e);
+    }
+
+    if let Some(tx) = &state.analytics_writer {
+        crate::analytics::record_payment(
+            tx,
+            "nostr_dm",
+            amount_sats,
+            Some(nostr_pubkey),
+            nostr_pubkey,
+            Some(&invoice.to_string()),
+        );
+    }
+
+    Ok(())
 }
 
 async fn get_lnurl(pubkey: nostr::PublicKey) -> anyhow::Result<LnUrl> {
     let client = Client::default();
-    client.add_relays(RELAYS).await?;
+    for relay in RELAYS {
+        client.add_relay(relay).await?;
+    }
     client.connect().await;
 
     let filter = Filter::new().author(pubkey).kind(Kind::Metadata).limit(1);
     let events = client
-        .get_events_of(vec![filter], Some(std::time::Duration::from_secs(10)))
+        .fetch_events(filter, std::time::Duration::from_secs(10))
         .await?;
     let event = events
         .into_iter()
         .max_by_key(|e| e.created_at)
         .ok_or(anyhow::anyhow!("no event"))?;
 
-    client.disconnect().await?;
+    client.disconnect().await;
 
     let metadata = Metadata::from_json(&event.content)?;
     let lnurl = metadata
@@ -173,12 +169,22 @@ async fn get_invoice(
 ) -> anyhow::Result<Bolt11Invoice> {
     let invoice = match crate::lightning::make_lnurl_request(&lnurl.url).await? {
         LnUrlResponse::LnUrlPayResponse(pay) => {
-            let amount_msats = pay.min_sendable * 2;
-            if amount_msats > MAX_SEND_AMOUNT {
+            let amount_msats = pay
+                .min_sendable
+                .checked_mul(2)
+                .ok_or_else(|| anyhow::anyhow!("invalid invoice amount"))?
+                .min(pay.max_sendable);
+            if amount_msats < pay.min_sendable {
+                anyhow::bail!("invalid LNURL amount range");
+            }
+            if amount_msats > MAX_SEND_AMOUNT * 1_000 {
                 anyhow::bail!("max amount is 1,000,000");
             }
 
-            let relays = RELAYS.iter().map(|r| UncheckedUrl::new(*r));
+            let relays = RELAYS
+                .iter()
+                .map(|relay| RelayUrl::parse(relay))
+                .collect::<Result<Vec<_>, _>>()?;
             let zap_data = ZapRequestData::new(pubkey, relays)
                 .lnurl(lnurl.encode())
                 .amount(amount_msats)
@@ -187,7 +193,12 @@ async fn get_invoice(
 
             let inv = crate::lightning::get_lnurl_invoice(&pay, amount_msats, Some(zap.as_json()))
                 .await?;
-            Bolt11Invoice::from_str(inv.invoice())?
+            let invoice = Bolt11Invoice::from_str(inv.invoice())
+                .map_err(|error| anyhow::anyhow!("invalid invoice: {error:?}"))?;
+            if invoice.amount_milli_satoshis() != Some(amount_msats) {
+                anyhow::bail!("LNURL invoice amount does not match the requested amount");
+            }
+            invoice
         }
         _ => anyhow::bail!("invalid lnurl"),
     };
@@ -198,7 +209,7 @@ async fn get_invoice(
 async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
     event.verify()?;
     let pubkey_str = event.pubkey.to_string();
-    let decrypted = nip04::decrypt(state.keys.secret_key()?, &event.pubkey, &event.content)?;
+    let decrypted = nip04::decrypt(state.keys.secret_key(), &event.pubkey, &event.content)?;
 
     if decrypted.to_lowercase() == "zap me" {
         info!("Zapping");
@@ -216,13 +227,12 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
         }
     }
 
-    if let Ok(params) = PaymentParams::from_str(&decrypted) {
-        if let Some(invoice) = params.invoice() {
+    if let Ok(params) = parse_payment_instructions(&decrypted, state.network).await {
+        if let Some(invoice) = params.invoice {
             pay_invoice(invoice, &state, &pubkey_str).await?;
-        }
-
-        if let Some(address) = params.address() {
-            let amount = params.amount().unwrap_or(Amount::from_sat(100_000));
+            return Ok(());
+        } else if let Some(address) = params.address {
+            let amount = Amount::from_sat(params.onchain_sats.unwrap_or(100_000));
 
             if amount.to_sat() > MAX_SEND_AMOUNT {
                 return Err(anyhow::anyhow!("Amount exceeds max send amount"));
