@@ -1017,6 +1017,16 @@ where
     }
 }
 
+/// Constant-time string comparison for bearer tokens. The length still
+/// leaks; tokens should be fixed-length random strings.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn verify_bearer_token(headers: &HeaderMap, expected: &Option<String>) -> Result<(), StatusCode> {
     let token = expected.as_deref().ok_or(StatusCode::NOT_FOUND)?;
     let provided = headers
@@ -1024,7 +1034,7 @@ fn verify_bearer_token(headers: &HeaderMap, expected: &Option<String>) -> Result
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    if provided != token {
+    if !ct_eq(provided, token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(())

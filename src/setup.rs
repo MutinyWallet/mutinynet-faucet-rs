@@ -293,17 +293,24 @@ pub async fn setup() -> anyhow::Result<AppState> {
     };
 
     let admin_token = env::var("ADMIN_TOKEN").ok();
-    if admin_token.is_some() {
-        info!("Admin API token configured");
-    } else {
-        warn!("ADMIN_TOKEN not set — admin endpoints will return 404");
+    match &admin_token {
+        Some(token) if token.len() < 32 => {
+            warn!("ADMIN_TOKEN is short; use at least 32 random characters")
+        }
+        Some(_) => info!("Admin API token configured"),
+        None => warn!("ADMIN_TOKEN not set — admin endpoints will return 404"),
     }
 
     let analytics_token = env::var("ANALYTICS_TOKEN").ok();
-    if analytics_token.is_some() {
-        info!("Analytics API token configured");
-    } else if analytics_db.is_some() {
-        warn!("ANALYTICS_TOKEN not set — analytics endpoints will return 404");
+    match &analytics_token {
+        Some(token) if token.len() < 32 => {
+            warn!("ANALYTICS_TOKEN is short; use at least 32 random characters")
+        }
+        Some(_) => info!("Analytics API token configured"),
+        None if analytics_db.is_some() => {
+            warn!("ANALYTICS_TOKEN not set — analytics endpoints will return 404")
+        }
+        None => {}
     }
 
     let arkade_daemon_url = env::var("ARKADE_DAEMON_URL").ok();
