@@ -94,8 +94,11 @@ pub struct AppState {
     /// Optional shared secret sent to the daemon as X-Internal-Token.
     pub arkade_internal_token: Option<String>,
     /// Outstanding LNURL-withdraw k1 challenges with their creation time.
-    /// k1s are random, single-use, and expire after K1_TTL.
+    /// k1s are random, single-use, and expire after CHALLENGE_TTL.
     lnurlw_k1s: Arc<Mutex<HashMap<String, Instant>>>,
+    /// Outstanding OAuth state parameters with their creation time
+    /// (login CSRF protection).
+    oauth_states: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 #[derive(Clone)]
@@ -148,6 +151,7 @@ impl AppState {
             arkade_daemon_url,
             arkade_internal_token,
             lnurlw_k1s: Arc::new(Mutex::new(HashMap::new())),
+            oauth_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -160,8 +164,8 @@ const INVOICE_REQ_DAILY_LIMIT: u64 = 60;
 /// Daily per-IP limit for L402 status checks (clients poll this endpoint).
 const L402_CHECK_DAILY_LIMIT: u64 = 600;
 
-/// How long an LNURL-withdraw k1 stays valid.
-const K1_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+/// How long a challenge (LNURL-withdraw k1, OAuth state) stays valid.
+const CHALLENGE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -339,14 +343,55 @@ async fn github_client_id(Extension(state): Extension<AppState>) -> Json<Value> 
     Json(json!({ "client_id": state.auth.github_client_id }))
 }
 
+const OAUTH_STATE_COOKIE: &str = "mutinynet_oauth_state";
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| {
+            cookies.split(';').find_map(|cookie| {
+                let (cookie_name, value) = cookie.trim().split_once('=')?;
+                (cookie_name == name).then_some(value)
+            })
+        })
+}
+
+fn oauth_state_cookie(value: &str, secure: bool, max_age: u64) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{OAUTH_STATE_COOKIE}={value}; Path=/auth/github/callback; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure}"
+    )
+}
+
 #[axum::debug_handler]
-async fn github_auth(Extension(state): Extension<AppState>) -> Result<Redirect, AppError> {
+async fn github_auth(Extension(state): Extension<AppState>) -> Result<Response, AppError> {
+    // Random state parameter, validated in the callback, to prevent login
+    // CSRF (an attacker tricking a victim's browser into completing the
+    // attacker's own OAuth flow).
+    let oauth_state = hex::encode(rand::random::<[u8; 16]>());
+    {
+        let mut states = state.oauth_states.lock().await;
+        states.retain(|_, created| created.elapsed() < CHALLENGE_TTL);
+        states.insert(oauth_state.clone(), Instant::now());
+    }
+
     let redirect_url = format!(
-        "https://github.com/login/oauth/authorize?client_id={}&scope=user:email&redirect_uri={}/auth/github/callback",
+        "https://github.com/login/oauth/authorize?client_id={}&scope=user:email&redirect_uri={}/auth/github/callback&state={}",
         state.auth.github_client_id,
-        state.host
+        state.host,
+        oauth_state
     );
-    Ok(Redirect::temporary(&redirect_url))
+    let mut response = Redirect::temporary(&redirect_url).into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        HeaderValue::from_str(&oauth_state_cookie(
+            &oauth_state,
+            state.host.starts_with("https://"),
+            CHALLENGE_TTL.as_secs(),
+        ))?,
+    );
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -421,7 +466,25 @@ async fn github_device(
 async fn github_callback(
     Query(params): Query<GithubCallback>,
     Extension(state): Extension<AppState>,
-) -> Result<Redirect, StatusCode> {
+    headers: HeaderMap,
+) -> Result<Response, StatusCode> {
+    // Validate the OAuth state parameter (single-use, 10-minute TTL).
+    let state_valid = match (
+        params.state.as_deref(),
+        cookie_value(&headers, OAUTH_STATE_COOKIE),
+    ) {
+        (Some(s), Some(cookie_state)) if ct_eq(s, cookie_state) => {
+            let mut states = state.oauth_states.lock().await;
+            states
+                .remove(s)
+                .is_some_and(|created| created.elapsed() < CHALLENGE_TTL)
+        }
+        _ => false,
+    };
+    if !state_valid {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     // Exchange code for access token
     let token_response = state
         .auth
@@ -488,10 +551,18 @@ async fn github_callback(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Redirect to frontend with token
-    Ok(Redirect::temporary(&format!(
-        "{}/?token={token}",
-        state.host
-    )))
+    let mut response =
+        Redirect::temporary(&format!("{}/?token={token}", state.host)).into_response();
+    response.headers_mut().insert(
+        axum::http::header::SET_COOKIE,
+        HeaderValue::from_str(&oauth_state_cookie(
+            "",
+            state.host.starts_with("https://"),
+            0,
+        ))
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    );
+    Ok(response)
 }
 
 #[axum::debug_handler]
@@ -546,7 +617,7 @@ async fn lnurlw_handler(
     {
         let mut k1s = state.lnurlw_k1s.lock().await;
         // Prune expired k1s so the map does not grow unbounded.
-        k1s.retain(|_, created| created.elapsed() < K1_TTL);
+        k1s.retain(|_, created| created.elapsed() < CHALLENGE_TTL);
         k1s.insert(k1.clone(), Instant::now());
     }
 
@@ -581,7 +652,7 @@ async fn lnurlw_callback_handler(
     let k1_valid = {
         let mut k1s = state.lnurlw_k1s.lock().await;
         k1s.remove(&payload.k1)
-            .is_some_and(|created| created.elapsed() < K1_TTL)
+            .is_some_and(|created| created.elapsed() < CHALLENGE_TTL)
     };
     if !k1_valid {
         return Err(Json(json!({"status": "ERROR", "reason": "Incorrect k1"})));
@@ -962,4 +1033,28 @@ async fn analytics_auth_middleware<B>(
 
 async fn fallback() -> (StatusCode, &'static str) {
     (StatusCode::NOT_FOUND, "Not found")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oauth_state_cookie_is_bound_to_request_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("other=x; mutinynet_oauth_state=expected"),
+        );
+
+        assert_eq!(cookie_value(&headers, OAUTH_STATE_COOKIE), Some("expected"));
+        assert!(ct_eq(
+            cookie_value(&headers, OAUTH_STATE_COOKIE).unwrap(),
+            "expected"
+        ));
+        assert!(!ct_eq(
+            cookie_value(&headers, OAUTH_STATE_COOKIE).unwrap(),
+            "attacker"
+        ));
+    }
 }

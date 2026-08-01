@@ -24,6 +24,8 @@ pub struct AuthState {
 #[derive(Deserialize)]
 pub struct GithubCallback {
     pub code: String,
+    /// OAuth state parameter (web flow only; the device flow does not use it)
+    pub state: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
