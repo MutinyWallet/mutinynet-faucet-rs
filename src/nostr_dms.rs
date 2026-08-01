@@ -15,6 +15,13 @@ use tonic_openssl_lnd::lnrpc;
 
 pub const RELAYS: [&str; 2] = ["wss://relay.primal.net", "wss://relay.damus.io"];
 
+/// Rate-limit identity shared by all nostr DM payments. Nostr keys are free
+/// to mint, so per-pubkey limits alone are not enough.
+const NOSTR_DM_GLOBAL_KEY: &str = "nostr_dm";
+
+/// Daily budget for all nostr DM payments combined, in sats.
+const NOSTR_DM_DAILY_LIMIT: u64 = 10 * MAX_SEND_AMOUNT;
+
 pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
     loop {
         let client = Client::new(&state.keys);
@@ -69,6 +76,25 @@ async fn pay_invoice(
         .amount_milli_satoshis()
         .is_some_and(|amt| amt / 1_000 < MAX_SEND_AMOUNT)
     {
+        let amount_sats = invoice.amount_milli_satoshis().unwrap_or(0) / 1_000;
+
+        // Rate-limit DM payments: per-pubkey and against the global DM
+        // budget, since nostr keys are free to mint.
+        if state.payments.get_total_payments(nostr_pubkey).await + amount_sats >= MAX_SEND_AMOUNT
+            || state.payments.get_total_payments(NOSTR_DM_GLOBAL_KEY).await + amount_sats
+                >= NOSTR_DM_DAILY_LIMIT
+        {
+            anyhow::bail!("Too many payments");
+        }
+        state
+            .payments
+            .add_payment(nostr_pubkey, None, None, amount_sats)
+            .await;
+        state
+            .payments
+            .add_payment(NOSTR_DM_GLOBAL_KEY, None, None, amount_sats)
+            .await;
+
         info!("Paying invoice: {invoice} from nostr dm");
         let mut lightning_client = state.lightning_client.clone();
 
@@ -207,6 +233,12 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 return Err(anyhow::anyhow!("Too many payments"));
             }
 
+            if state.payments.get_total_payments(NOSTR_DM_GLOBAL_KEY).await + amount.to_sat()
+                >= NOSTR_DM_DAILY_LIMIT
+            {
+                return Err(anyhow::anyhow!("Too many payments"));
+            }
+
             state
                 .payments
                 .add_payment(
@@ -215,6 +247,10 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                     None,
                     amount.to_sat(),
                 )
+                .await;
+            state
+                .payments
+                .add_payment(NOSTR_DM_GLOBAL_KEY, None, None, amount.to_sat())
                 .await;
 
             let resp = {
