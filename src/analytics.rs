@@ -229,6 +229,19 @@ pub fn record_l402_paid(pool: &SqlitePool, payment_hash: &str) {
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::combined_limit;
+
+    #[test]
+    fn combined_limits_are_bounded() {
+        assert_eq!(combined_limit(None), 50);
+        assert_eq!(combined_limit(Some(-1)), 1);
+        assert_eq!(combined_limit(Some(100)), 100);
+        assert_eq!(combined_limit(Some(10_000)), 500);
+    }
+}
+
 fn get_pool(state: &crate::AppState) -> Result<&SqlitePool, AppError> {
     state
         .analytics_db
@@ -252,7 +265,7 @@ pub async fn analytics_summary(
 ) -> Result<Json<Value>, AppError> {
     let pool = get_pool(&state)?;
 
-    let hours = params.hours.unwrap_or(24);
+    let hours = params.hours.unwrap_or(24).clamp(1, 8760);
     let cutoff = chrono::Utc::now().timestamp() - (hours * 3600);
 
     let (type_filter, bind_type) = type_filter_clause(&params.payment_type, 2);
@@ -336,7 +349,7 @@ pub async fn analytics_timeseries(
 ) -> Result<Json<Value>, AppError> {
     let pool = get_pool(&state)?;
 
-    let hours = params.hours.unwrap_or(24);
+    let hours = params.hours.unwrap_or(24).clamp(1, 8760);
     let cutoff = chrono::Utc::now().timestamp() - (hours * 3600);
     let interval = params.interval.as_deref().unwrap_or("hour");
 
@@ -435,8 +448,8 @@ pub async fn analytics_users(
 ) -> Result<Json<Value>, AppError> {
     let pool = get_pool(&state)?;
 
-    let hours = params.hours.unwrap_or(24);
-    let limit = params.limit.unwrap_or(50);
+    let hours = params.hours.unwrap_or(24).clamp(1, 8760);
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let cutoff = chrono::Utc::now().timestamp() - (hours * 3600);
 
     let (type_filter, bind_type) = type_filter_clause(&params.payment_type, 3);
@@ -541,7 +554,7 @@ pub async fn analytics_recent(
 ) -> Result<Json<Value>, AppError> {
     let pool = get_pool(&state)?;
 
-    let limit = params.limit.unwrap_or(50);
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let (type_filter, bind_type) = type_filter_clause(&params.payment_type, 2);
 
     let query_str = format!(
@@ -597,7 +610,7 @@ pub async fn user_recent(
 ) -> Result<Json<Value>, AppError> {
     let pool = get_pool(&state)?;
 
-    let limit = params.limit.unwrap_or(50);
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let (type_filter, bind_type) = type_filter_clause(&params.payment_type, 2);
 
     let query_str = format!(
@@ -622,13 +635,20 @@ pub async fn user_recent(
         .map(|row| {
             let user_id = row.get::<String, _>("user_id");
             let is_mine = user_id == user.username;
+            // Only expose payment destinations (addresses, invoices) on the
+            // caller's own rows; other users' destinations are private.
+            let destination = if is_mine {
+                row.get::<Option<String>, _>("destination")
+            } else {
+                None
+            };
             json!({
                 "id": row.get::<i64, _>("id"),
                 "created_at": row.get::<i64, _>("created_at"),
                 "payment_type": row.get::<String, _>("payment_type"),
                 "amount_sats": row.get::<i64, _>("amount_sats"),
                 "is_mine": is_mine,
-                "destination": row.get::<Option<String>, _>("destination"),
+                "destination": destination,
             })
         })
         .collect();
@@ -656,8 +676,8 @@ pub async fn analytics_domains(
 ) -> Result<Json<Value>, AppError> {
     let pool = get_pool(&state)?;
 
-    let hours = params.hours.unwrap_or(24);
-    let limit = params.limit.unwrap_or(50);
+    let hours = params.hours.unwrap_or(24).clamp(1, 8760);
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let cutoff = chrono::Utc::now().timestamp() - (hours * 3600);
 
     let (type_filter, bind_type) = type_filter_clause(&params.payment_type, 3);
@@ -726,7 +746,7 @@ pub async fn analytics_l402(
 ) -> Result<Json<Value>, AppError> {
     let pool = get_pool(&state)?;
 
-    let hours = params.hours.unwrap_or(24);
+    let hours = params.hours.unwrap_or(24).clamp(1, 8760);
     let cutoff = chrono::Utc::now().timestamp() - (hours * 3600);
     let interval = params.interval.as_deref().unwrap_or("hour");
 
@@ -911,18 +931,22 @@ pub struct CombinedParams {
     pub domains_limit: Option<i64>,
 }
 
+fn combined_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(50).clamp(1, 500)
+}
+
 pub async fn analytics_combined(
     Extension(state): Extension<crate::AppState>,
     Query(params): Query<CombinedParams>,
 ) -> Result<Json<Value>, AppError> {
     let pool = get_pool(&state)?;
 
-    let hours = params.hours.unwrap_or(24);
+    let hours = params.hours.unwrap_or(24).clamp(1, 8760);
     let cutoff = chrono::Utc::now().timestamp() - (hours * 3600);
     let interval = params.interval.as_deref().unwrap_or("hour");
-    let recent_limit = params.recent_limit.unwrap_or(50);
-    let users_limit = params.users_limit.unwrap_or(50);
-    let domains_limit = params.domains_limit.unwrap_or(50);
+    let recent_limit = combined_limit(params.recent_limit);
+    let users_limit = combined_limit(params.users_limit);
+    let domains_limit = combined_limit(params.domains_limit);
 
     let format_str = match interval {
         "day" => "%Y-%m-%d",
