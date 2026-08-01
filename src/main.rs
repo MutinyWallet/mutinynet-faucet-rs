@@ -720,10 +720,12 @@ async fn l402_check_handler(
         .into_inner();
 
     if invoice.state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Settled as i32 {
-        let preimage_hex = hex::encode(&invoice.r_preimage);
+        // Never return the preimage here: the token is public by design
+        // (it travels in URLs and the 402 challenge), so anyone holding it
+        // could steal the payer's preimage. The payer learns the preimage
+        // from their own Lightning payment.
         Ok(Json(json!({
             "status": "settled",
-            "preimage": preimage_hex,
         })))
     } else if invoice.state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Canceled as i32 {
         Ok(Json(json!({
