@@ -183,7 +183,9 @@ pub async fn pay_lightning(
             .author(npub.into())
             .kind(Kind::Metadata)
             .limit(1);
-        let events = client.get_events_of(vec![filter], None).await?;
+        let events = client
+            .get_events_of(vec![filter], Some(std::time::Duration::from_secs(10)))
+            .await?;
         let event = events
             .into_iter()
             .max_by_key(|e| e.created_at)
@@ -244,14 +246,17 @@ pub async fn pay_lightning(
             anyhow::bail!("Too many payments");
         }
 
-        let response = lightning_client
-            .send_payment_sync(lnrpc::SendRequest {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            lightning_client.send_payment_sync(lnrpc::SendRequest {
                 payment_request: invoice.to_string(),
                 allow_self_payment: true,
                 ..Default::default()
-            })
-            .await?
-            .into_inner();
+            }),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("payment timed out"))??
+        .into_inner();
 
         if !response.payment_error.is_empty() {
             // LND returned a completed response that explicitly says no

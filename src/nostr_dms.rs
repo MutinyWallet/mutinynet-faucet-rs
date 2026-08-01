@@ -99,16 +99,28 @@ async fn pay_invoice(
         info!("Paying invoice: {invoice} from nostr dm");
         let mut lightning_client = state.lightning_client.clone();
 
-        let response = lightning_client
-            .send_payment_sync(lnrpc::SendRequest {
-                payment_request: invoice.to_string(),
-                ..Default::default()
-            })
-            .await?
+        let payment_result = async {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                lightning_client.send_payment_sync(lnrpc::SendRequest {
+                    payment_request: invoice.to_string(),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("payment timed out"))??
             .into_inner();
 
-        if !response.payment_error.is_empty() {
-            return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
+            if !response.payment_error.is_empty() {
+                anyhow::bail!("Payment error: {}", response.payment_error);
+            }
+            Ok::<_, anyhow::Error>(response)
+        }
+        .await;
+
+        if let Err(e) = payment_result {
+            state.payments.release(&keys, amount_sats).await;
+            return Err(e);
         }
 
         if let Some(tx) = &state.analytics_writer {
@@ -134,7 +146,9 @@ async fn get_lnurl(pubkey: nostr::PublicKey) -> anyhow::Result<LnUrl> {
     client.connect().await;
 
     let filter = Filter::new().author(pubkey).kind(Kind::Metadata).limit(1);
-    let events = client.get_events_of(vec![filter], None).await?;
+    let events = client
+        .get_events_of(vec![filter], Some(std::time::Duration::from_secs(10)))
+        .await?;
     let event = events
         .into_iter()
         .max_by_key(|e| e.created_at)
@@ -226,7 +240,7 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 return Err(anyhow::anyhow!("Too many payments"));
             }
 
-            let resp = {
+            let send_result = {
                 let mut wallet_client = state.lightning_client.clone();
                 info!("Sending {amount} to {address} from nostr dm");
                 let req = lnrpc::SendCoinsRequest {
@@ -236,7 +250,15 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                     sat_per_vbyte: 1,
                     ..Default::default()
                 };
-                wallet_client.send_coins(req).await?.into_inner()
+                wallet_client.send_coins(req).await.map(|r| r.into_inner())
+            };
+
+            let resp = match send_result {
+                Ok(resp) => resp,
+                Err(e) => {
+                    state.payments.release(&keys, amount.to_sat()).await;
+                    return Err(e.into());
+                }
             };
 
             let txid = resp.txid;

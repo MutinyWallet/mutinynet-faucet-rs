@@ -83,7 +83,9 @@ pub async fn setup() -> anyhow::Result<AppState> {
     };
 
     let auth = AuthState {
-        client: reqwest::Client::new(),
+        client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?,
         github_client_id,
         github_client_secret,
         jwt_secret,

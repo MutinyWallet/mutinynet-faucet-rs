@@ -14,7 +14,7 @@ use bitcoin_waila::PaymentParams;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use lightning_invoice::Bolt11Invoice;
 use lnurl::withdraw::WithdrawalResponse;
-use lnurl::{AsyncClient, Tag};
+use lnurl::Tag;
 use log::{error, info, warn};
 use nostr::key::Keys;
 use serde::{Deserialize, Serialize};
@@ -72,7 +72,6 @@ pub struct AppState {
     mainnet_lightning_client: Option<LndLightningClient>,
     bitcoin_rpc: Option<Arc<bitcoincore_rpc::Client>>,
     reorg_db: Option<SqlitePool>,
-    lnurl: AsyncClient,
     payments: PaymentsByIp,
     auth: AuthState,
     reorg_config: ReorgConfig,
@@ -128,7 +127,6 @@ impl AppState {
         arkade_daemon_url: Option<String>,
         arkade_internal_token: Option<String>,
     ) -> Self {
-        let lnurl = lnurl::Builder::default().build_async().unwrap();
         AppState {
             host,
             keys,
@@ -137,7 +135,6 @@ impl AppState {
             mainnet_lightning_client,
             bitcoin_rpc,
             reorg_db,
-            lnurl,
             payments: PaymentsByIp::new(),
             auth,
             reorg_config,

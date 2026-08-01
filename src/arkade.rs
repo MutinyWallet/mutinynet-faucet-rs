@@ -48,8 +48,12 @@ pub async fn dispense_arkade(
         anyhow::bail!("Too many payments");
     }
 
+    // Do not leak the internal daemon URL or its response body to clients.
     let daemon_url = daemon_url.trim_end_matches('/');
-    let mut req = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+    let mut req = client
         .post(format!("{daemon_url}/send"))
         .json(&serde_json::json!({ "address": payload.address, "sats": payload.sats }));
 
@@ -57,7 +61,6 @@ pub async fn dispense_arkade(
         req = req.header("X-Internal-Token", token);
     }
 
-    // Do not leak the internal daemon URL or its response body to clients.
     let resp = req.send().await.map_err(|e| {
         log::error!("arkade daemon request failed: {e}");
         anyhow::anyhow!("arkade dispenser unavailable")
