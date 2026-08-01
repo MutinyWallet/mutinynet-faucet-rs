@@ -111,8 +111,41 @@ pub async fn init_users_db(path: &str) -> anyhow::Result<SqlitePool> {
 
     // Migrate from text files if tables are empty and files exist
     migrate_from_files(&pool).await;
+    normalize_user_values(&pool).await?;
 
     Ok(pool)
+}
+
+/// Rewrite legacy mixed-case rows to the same normalized representation used
+/// by the cache and admin endpoints. Rebuilding each single-column table also
+/// collapses duplicates that differ only by case.
+async fn normalize_user_values(pool: &SqlitePool) -> anyhow::Result<()> {
+    let tables = [
+        ("banned_domains", "domain"),
+        ("banned_users", "email"),
+        ("whitelisted_users", "email"),
+        ("premium_users", "email"),
+    ];
+    let mut tx = pool.begin().await?;
+
+    for (table, column) in tables {
+        let select = format!("SELECT {column} FROM {table}");
+        let values: Vec<(String,)> = sqlx::query_as(&select).fetch_all(&mut *tx).await?;
+
+        let delete = format!("DELETE FROM {table}");
+        sqlx::query(&delete).execute(&mut *tx).await?;
+
+        let insert = format!("INSERT OR IGNORE INTO {table} ({column}) VALUES (?)");
+        for (value,) in values {
+            let value = value.trim().to_lowercase();
+            if !value.is_empty() {
+                sqlx::query(&insert).bind(value).execute(&mut *tx).await?;
+            }
+        }
+    }
+
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn migrate_from_files(pool: &SqlitePool) {
@@ -219,12 +252,15 @@ impl UsersCache {
     }
 
     pub async fn check_status(&self, email: &str) -> UserStatus {
+        // Emails and domains are matched case-insensitively; values are
+        // normalized to lowercase on write and on load.
+        let email = email.to_lowercase();
         let sets = self.sets.read().await;
-        let whitelisted = sets.whitelisted_users.contains(email);
-        let premium = sets.premium_users.contains(email);
+        let whitelisted = sets.whitelisted_users.contains(&email);
+        let premium = sets.premium_users.contains(&email);
         let domain = email.split('@').next_back().unwrap_or("");
-        let domain_banned = sets.banned_domains.contains(&domain.to_lowercase());
-        let user_banned = sets.banned_users.contains(email);
+        let domain_banned = sets.banned_domains.contains(domain);
+        let user_banned = sets.banned_users.contains(&email);
 
         UserStatus {
             is_premium: premium,
@@ -277,7 +313,46 @@ impl UsersCache {
 
 async fn load_set(pool: &SqlitePool, query: &str) -> anyhow::Result<HashSet<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(query).fetch_all(pool).await?;
-    Ok(rows.into_iter().map(|r| r.0).collect())
+    // Normalize case so lookups are case-insensitive regardless of how the
+    // value was originally stored.
+    Ok(rows.into_iter().map(|r| r.0.to_lowercase()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn normalizes_and_deduplicates_legacy_user_rows() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        for (table, column) in [
+            ("banned_domains", "domain"),
+            ("banned_users", "email"),
+            ("whitelisted_users", "email"),
+            ("premium_users", "email"),
+        ] {
+            sqlx::query(&format!(
+                "CREATE TABLE {table} ({column} TEXT PRIMARY KEY NOT NULL)"
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query("INSERT INTO banned_users (email) VALUES (?), (?)")
+            .bind("Alice@Example.com")
+            .bind("alice@example.com")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        normalize_user_values(&pool).await.unwrap();
+
+        let rows: Vec<(String,)> = sqlx::query_as("SELECT email FROM banned_users")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, vec![("alice@example.com".to_string(),)]);
+    }
 }
 
 #[derive(Debug, Clone)]

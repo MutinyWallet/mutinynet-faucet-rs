@@ -47,7 +47,8 @@ pub async fn admin_add(
     Json(payload): Json<AdminEntry>,
 ) -> Result<StatusCode, StatusCode> {
     let (table, column) = table_and_column(&list).ok_or(StatusCode::NOT_FOUND)?;
-    let value = payload.value.trim().to_string();
+    // Normalize case; lookups are case-insensitive.
+    let value = payload.value.trim().to_lowercase();
     if value.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -72,9 +73,11 @@ pub async fn admin_remove(
     Json(payload): Json<AdminEntry>,
 ) -> Result<StatusCode, StatusCode> {
     let (table, column) = table_and_column(&list).ok_or(StatusCode::NOT_FOUND)?;
+    // Normalize case; lookups are case-insensitive.
+    let value = payload.value.trim().to_lowercase();
     let query = format!("DELETE FROM {} WHERE {} = ?", table, column);
     let result = sqlx::query(&query)
-        .bind(&payload.value)
+        .bind(&value)
         .execute(&state.users_db)
         .await
         .map_err(|e| {
@@ -84,8 +87,8 @@ pub async fn admin_remove(
     if result.rows_affected() == 0 {
         Err(StatusCode::NOT_FOUND)
     } else {
-        state.users_cache.remove(&list, &payload.value).await;
-        info!("Admin: removed '{}' from {}", payload.value, table);
+        state.users_cache.remove(&list, &value).await;
+        info!("Admin: removed '{}' from {}", value, table);
         Ok(StatusCode::OK)
     }
 }
