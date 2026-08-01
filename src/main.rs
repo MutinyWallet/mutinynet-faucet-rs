@@ -485,10 +485,7 @@ async fn onchain_handler(
     Json(payload): Json<OnchainRequest>,
 ) -> Result<Json<OnchainResponse>, AppError> {
     // Extract the X-Forwarded-For header
-    let x_forwarded_for = headers
-        .get("x-forwarded-for")
-        .and_then(|x| HeaderValue::to_str(x).ok())
-        .unwrap_or("Unknown");
+    let x_forwarded_for = client_ip(&headers);
 
     let params = PaymentParams::from_str(&payload.address)
         .map_err(|_| anyhow::anyhow!("invalid address"))?;
@@ -516,10 +513,7 @@ async fn lightning_handler(
     Json(payload): Json<LightningRequest>,
 ) -> Result<Json<LightningResponse>, AppError> {
     // Extract the X-Forwarded-For header
-    let x_forwarded_for = headers
-        .get("x-forwarded-for")
-        .and_then(|x| HeaderValue::to_str(x).ok())
-        .unwrap_or("Unknown");
+    let x_forwarded_for = client_ip(&headers);
 
     if state
         .payments
@@ -540,10 +534,7 @@ async fn lnurlw_handler(
     Extension(state): Extension<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<WithdrawalResponse>, AppError> {
-    let x_forwarded_for = headers
-        .get("x-forwarded-for")
-        .and_then(|x| HeaderValue::to_str(x).ok())
-        .unwrap_or("Unknown");
+    let x_forwarded_for = client_ip(&headers);
 
     let k1 = generate_lnurlw_k1(&state.auth.jwt_secret, x_forwarded_for);
 
@@ -572,10 +563,7 @@ async fn lnurlw_callback_handler(
     Query(payload): Query<LnurlWithdrawParams>,
 ) -> Result<Json<Value>, Json<Value>> {
     // Extract the X-Forwarded-For header
-    let x_forwarded_for = headers
-        .get("x-forwarded-for")
-        .and_then(|x| HeaderValue::to_str(x).ok())
-        .unwrap_or("Unknown");
+    let x_forwarded_for = client_ip(&headers);
 
     let expected_k1 = generate_lnurlw_k1(&state.auth.jwt_secret, x_forwarded_for);
     if payload.k1 != expected_k1 {
@@ -750,10 +738,7 @@ async fn channel_handler(
     Json(payload): Json<ChannelRequest>,
 ) -> Result<Json<ChannelResponse>, AppError> {
     // Extract the X-Forwarded-For header
-    let x_forwarded_for = headers
-        .get("x-forwarded-for")
-        .and_then(|x| HeaderValue::to_str(x).ok())
-        .unwrap_or("Unknown");
+    let x_forwarded_for = client_ip(&headers);
 
     if state
         .payments
@@ -792,10 +777,7 @@ async fn limits_handler(
     Extension(user): Extension<AuthUser>,
     headers: HeaderMap,
 ) -> Result<Json<LimitsResponse>, AppError> {
-    let x_forwarded_for = headers
-        .get("x-forwarded-for")
-        .and_then(|x| HeaderValue::to_str(x).ok())
-        .unwrap_or("Unknown");
+    let x_forwarded_for = client_ip(&headers);
 
     let (ip_used, user_used) = state.payments.get_usage(x_forwarded_for, Some(&user)).await;
 
@@ -823,10 +805,7 @@ async fn arkade_handler(
     headers: HeaderMap,
     Json(payload): Json<ArkadeRequest>,
 ) -> Result<Json<ArkadeResponse>, AppError> {
-    let x_forwarded_for = headers
-        .get("x-forwarded-for")
-        .and_then(|x| HeaderValue::to_str(x).ok())
-        .unwrap_or("Unknown");
+    let x_forwarded_for = client_ip(&headers);
 
     if state
         .payments
@@ -860,6 +839,22 @@ fn generate_lnurlw_k1(secret: &str, identity: &str) -> String {
     engine.input(identity.as_bytes());
     let hmac = hmac::Hmac::<sha256::Hash>::from_engine(engine);
     hex::encode(hmac.to_byte_array())
+}
+
+/// Extract the client IP used for rate limiting.
+///
+/// nginx sets `X-Forwarded-For: $proxy_add_x_forwarded_for`, which appends
+/// the real client IP as the rightmost entry. Any earlier entries are
+/// client-supplied and must not be trusted, so only the rightmost entry is
+/// used as the rate-limit identity.
+fn client_ip(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|x| HeaderValue::to_str(x).ok())
+        .and_then(|x| x.rsplit(',').next())
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .unwrap_or("Unknown")
 }
 
 // Make our own error that wraps `anyhow::Error`.
