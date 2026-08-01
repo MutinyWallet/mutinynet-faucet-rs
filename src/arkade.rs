@@ -57,11 +57,16 @@ pub async fn dispense_arkade(
         req = req.header("X-Internal-Token", token);
     }
 
-    let resp = req.send().await?;
+    // Do not leak the internal daemon URL or its response body to clients.
+    let resp = req.send().await.map_err(|e| {
+        log::error!("arkade daemon request failed: {e}");
+        anyhow::anyhow!("arkade dispenser unavailable")
+    })?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("arkade daemon returned {status}: {body}");
+        log::error!("arkade daemon returned {status}: {body}");
+        anyhow::bail!("arkade dispenser unavailable");
     }
 
     let json: serde_json::Value = resp.json().await?;

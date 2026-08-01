@@ -1,6 +1,6 @@
 use axum::extract::Query;
 use axum::headers::{HeaderMap, HeaderValue};
-use axum::http::{Request, Uri};
+use axum::http::Request;
 use axum::middleware::Next;
 use axum::response::Redirect;
 use axum::{
@@ -879,6 +879,9 @@ impl AppError {
 // Tell axum how to convert `AppError` into a response.
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // Log the full error chain server-side; the client only gets the
+        // top-level message.
+        error!("request failed: {:?}", self.0);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Error: {}", self.0),
@@ -937,6 +940,6 @@ async fn analytics_auth_middleware<B>(
     Ok(next.run(request).await)
 }
 
-async fn fallback(uri: Uri) -> (StatusCode, String) {
-    (StatusCode::NOT_FOUND, format!("No route for {}", uri))
+async fn fallback() -> (StatusCode, &'static str) {
+    (StatusCode::NOT_FOUND, "Not found")
 }
