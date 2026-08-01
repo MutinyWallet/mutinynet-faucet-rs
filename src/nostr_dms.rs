@@ -45,7 +45,7 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
             match notification {
                 RelayPoolNotification::Event { event, .. } => {
                     if event.kind == Kind::EncryptedDirectMessage {
-                        info!("Received dm: {}", event.as_json());
+                        info!("Received dm: {}", event.id);
                         tokio::spawn({
                             let state = state.clone();
                             async move {
@@ -55,7 +55,7 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
                             }
                         });
                     } else {
-                        warn!("Received unexpected event: {}", event.as_json());
+                        warn!("Received unexpected event: {}", event.id);
                     }
                 }
                 RelayPoolNotification::Shutdown => {
@@ -96,7 +96,7 @@ async fn pay_invoice(
             anyhow::bail!("Too many payments");
         }
 
-        info!("Paying invoice: {invoice} from nostr dm");
+        info!("Paying invoice {} from nostr dm", invoice.payment_hash());
         let mut lightning_client = state.lightning_client.clone();
 
         let payment_result = async {

@@ -226,7 +226,7 @@ pub async fn pay_lightning(
     let payment_preimage = {
         let mut lightning_client = state.lightning_client.clone();
 
-        info!("Paying invoice {invoice}");
+        info!("Paying invoice {}", invoice.payment_hash());
 
         let amount_sats = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
 

@@ -80,8 +80,8 @@ pub async fn dispense_arkade(
         .to_string();
 
     info!(
-        "arkade dispensed {} sats to {} for gh:{}",
-        payload.sats, payload.address, user.username
+        "arkade dispensed {} sats to {}",
+        payload.sats, payload.address
     );
 
     if let Some(tx) = &state.analytics_writer {

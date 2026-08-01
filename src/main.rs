@@ -473,10 +473,7 @@ async fn github_device(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    info!(
-        "Authing user with email through device: {}",
-        primary_email.email
-    );
+    info!("Authing user through device flow");
 
     // Create JWT
     let claims = auth::TokenClaims {
@@ -568,7 +565,7 @@ async fn github_callback(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    info!("Authing user with email: {}", primary_email.email);
+    info!("Authing user through GitHub web flow");
 
     // Create JWT
     let claims = auth::TokenClaims {

@@ -78,7 +78,7 @@ pub async fn pay_onchain(
 
     let resp = {
         let mut wallet_client = state.lightning_client.clone();
-        info!("Sending {amount} to {address} for gh:{}", user.username);
+        info!("Sending {amount} to {address}");
         let req = tonic_openssl_lnd::lnrpc::SendCoinsRequest {
             addr: address.to_string(),
             amount: amount.to_sat() as i64,
