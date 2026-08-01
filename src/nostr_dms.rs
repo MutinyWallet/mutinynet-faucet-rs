@@ -79,21 +79,14 @@ async fn pay_invoice(
         let amount_sats = invoice.amount_milli_satoshis().unwrap_or(0) / 1_000;
 
         // Rate-limit DM payments: per-pubkey and against the global DM
-        // budget, since nostr keys are free to mint.
-        if state.payments.get_total_payments(nostr_pubkey).await + amount_sats >= MAX_SEND_AMOUNT
-            || state.payments.get_total_payments(NOSTR_DM_GLOBAL_KEY).await + amount_sats
-                >= NOSTR_DM_DAILY_LIMIT
-        {
+        // budget, since nostr keys are free to mint. Atomic check-and-record.
+        let keys = [
+            (nostr_pubkey, MAX_SEND_AMOUNT),
+            (NOSTR_DM_GLOBAL_KEY, NOSTR_DM_DAILY_LIMIT),
+        ];
+        if !state.payments.try_reserve(&keys, amount_sats).await {
             anyhow::bail!("Too many payments");
         }
-        state
-            .payments
-            .add_payment(nostr_pubkey, None, None, amount_sats)
-            .await;
-        state
-            .payments
-            .add_payment(NOSTR_DM_GLOBAL_KEY, None, None, amount_sats)
-            .await;
 
         info!("Paying invoice: {invoice} from nostr dm");
         let mut lightning_client = state.lightning_client.clone();
@@ -215,43 +208,17 @@ async fn handle_event(event: Event, state: AppState) -> anyhow::Result<()> {
                 return Err(anyhow::anyhow!("Amount exceeds max send amount"));
             }
 
-            if state
-                .payments
-                .get_total_payments(&event.pubkey.to_string())
-                .await
-                > MAX_SEND_AMOUNT
-            {
+            // Atomic check-and-record against the per-pubkey, per-address,
+            // and global DM limits.
+            let address_key = address.to_string();
+            let keys = [
+                (pubkey_str.as_str(), MAX_SEND_AMOUNT),
+                (address_key.as_str(), MAX_SEND_AMOUNT),
+                (NOSTR_DM_GLOBAL_KEY, NOSTR_DM_DAILY_LIMIT),
+            ];
+            if !state.payments.try_reserve(&keys, amount.to_sat()).await {
                 return Err(anyhow::anyhow!("Too many payments"));
             }
-
-            if state
-                .payments
-                .get_total_payments(&address.to_string())
-                .await
-                > MAX_SEND_AMOUNT
-            {
-                return Err(anyhow::anyhow!("Too many payments"));
-            }
-
-            if state.payments.get_total_payments(NOSTR_DM_GLOBAL_KEY).await + amount.to_sat()
-                >= NOSTR_DM_DAILY_LIMIT
-            {
-                return Err(anyhow::anyhow!("Too many payments"));
-            }
-
-            state
-                .payments
-                .add_payment(
-                    &event.pubkey.to_string(),
-                    Some(&address),
-                    None,
-                    amount.to_sat(),
-                )
-                .await;
-            state
-                .payments
-                .add_payment(NOSTR_DM_GLOBAL_KEY, None, None, amount.to_sat())
-                .await;
 
             let resp = {
                 let mut wallet_client = state.lightning_client.clone();

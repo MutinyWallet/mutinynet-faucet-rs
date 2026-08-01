@@ -489,16 +489,7 @@ async fn onchain_handler(
 
     let params = PaymentParams::from_str(&payload.address)
         .map_err(|_| anyhow::anyhow!("invalid address"))?;
-    let address_str = params.address().ok_or(anyhow::anyhow!("invalid address"))?;
-
-    if state
-        .payments
-        .verify_payments(x_forwarded_for, Some(&address_str), Some(&user))
-        .await
-        && !user.is_premium
-    {
-        return Err(AppError::new("Too many payments"));
-    }
+    let _address_str = params.address().ok_or(anyhow::anyhow!("invalid address"))?;
 
     let res = pay_onchain(&state, x_forwarded_for, user, payload).await?;
 
@@ -514,15 +505,6 @@ async fn lightning_handler(
 ) -> Result<Json<LightningResponse>, AppError> {
     // Extract the X-Forwarded-For header
     let x_forwarded_for = client_ip(&headers);
-
-    if state
-        .payments
-        .verify_payments(x_forwarded_for, None, Some(&user))
-        .await
-        && !user.is_premium
-    {
-        return Err(AppError::new("Too many payments"));
-    }
 
     let payment_hash = pay_lightning(&state, x_forwarded_for, Some(&user), &payload.bolt11).await?;
 
@@ -579,12 +561,7 @@ async fn lnurlw_callback_handler(
         ));
     }
 
-    if state.payments.get_total_payments(x_forwarded_for).await > MAX_SEND_AMOUNT {
-        return Err(Json(
-            json!({"status": "ERROR", "reason": "Rate limit exceeded"}),
-        ));
-    }
-
+    // The rate limit is enforced atomically inside pay_lightning.
     pay_lightning(&state, x_forwarded_for, None, &payload.pr)
         .await
         .map_err(|e| Json(json!({"status": "ERROR", "reason": format!("{e}")})))?;
@@ -740,15 +717,6 @@ async fn channel_handler(
     // Extract the X-Forwarded-For header
     let x_forwarded_for = client_ip(&headers);
 
-    if state
-        .payments
-        .verify_payments(x_forwarded_for, None, Some(&user))
-        .await
-        && !user.is_premium
-    {
-        return Err(AppError::new("Too many payments"));
-    }
-
     let txid = open_channel(&state, x_forwarded_for, Some(&user), payload).await?;
 
     Ok(Json(ChannelResponse { txid }))
@@ -784,7 +752,7 @@ async fn limits_handler(
     let remaining = if user.is_premium {
         MAX_SEND_AMOUNT
     } else {
-        // The most-restrictive identifier wins (matches verify_payments).
+        // The most-restrictive identifier wins (matches try_reserve_payment).
         MAX_SEND_AMOUNT.saturating_sub(ip_used.max(user_used))
     };
 
@@ -806,15 +774,6 @@ async fn arkade_handler(
     Json(payload): Json<ArkadeRequest>,
 ) -> Result<Json<ArkadeResponse>, AppError> {
     let x_forwarded_for = client_ip(&headers);
-
-    if state
-        .payments
-        .verify_payments(x_forwarded_for, None, Some(&user))
-        .await
-        && !user.is_premium
-    {
-        return Err(AppError::new("Too many payments"));
-    }
 
     let res = dispense_arkade(&state, x_forwarded_for, &user, payload).await?;
     Ok(Json(res))

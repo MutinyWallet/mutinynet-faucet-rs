@@ -51,15 +51,30 @@ pub async fn pay_onchain(
         anyhow::bail!("max amount is 1,000,000");
     }
 
-    state
+    // Atomically check the limits and record the payment before sending.
+    // Premium users bypass the limit but are still tracked.
+    if user.is_premium {
+        state
+            .payments
+            .add_payment(
+                x_forwarded_for,
+                Some(&address),
+                Some(&user),
+                amount.to_sat(),
+            )
+            .await;
+    } else if !state
         .payments
-        .add_payment(
+        .try_reserve_payment(
             x_forwarded_for,
             Some(&address),
             Some(&user),
             amount.to_sat(),
         )
-        .await;
+        .await
+    {
+        anyhow::bail!("Too many payments");
+    }
 
     let resp = {
         let mut wallet_client = state.lightning_client.clone();

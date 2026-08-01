@@ -33,10 +33,20 @@ pub async fn dispense_arkade(
         anyhow::bail!("max amount is 1,000,000");
     }
 
-    state
+    // Atomically check the limits and record the payment before dispensing.
+    // Premium users bypass the limit but are still tracked.
+    if user.is_premium {
+        state
+            .payments
+            .add_payment(x_forwarded_for, None, Some(user), payload.sats)
+            .await;
+    } else if !state
         .payments
-        .add_payment(x_forwarded_for, None, Some(user), payload.sats)
-        .await;
+        .try_reserve_payment(x_forwarded_for, None, Some(user), payload.sats)
+        .await
+    {
+        anyhow::bail!("Too many payments");
+    }
 
     let daemon_url = daemon_url.trim_end_matches('/');
     let mut req = reqwest::Client::new()

@@ -123,15 +123,23 @@ pub async fn pay_lightning(
 
         info!("Paying invoice {invoice}");
 
-        state
+        let amount_sats = invoice.amount_milli_satoshis().unwrap_or(0) / 1000;
+
+        // Atomically check the limits and record the payment before paying.
+        // Premium users bypass the limit but are still tracked.
+        let premium = user.is_some_and(|u| u.is_premium);
+        if premium {
+            state
+                .payments
+                .add_payment(x_forwarded_for, None, user, amount_sats)
+                .await;
+        } else if !state
             .payments
-            .add_payment(
-                x_forwarded_for,
-                None,
-                user,
-                invoice.amount_milli_satoshis().unwrap_or(0) / 1000,
-            )
-            .await;
+            .try_reserve_payment(x_forwarded_for, None, user, amount_sats)
+            .await
+        {
+            anyhow::bail!("Too many payments");
+        }
 
         let response = lightning_client
             .send_payment_sync(lnrpc::SendRequest {
@@ -143,6 +151,16 @@ pub async fn pay_lightning(
             .into_inner();
 
         if !response.payment_error.is_empty() {
+            // LND returned a completed response that explicitly says no
+            // payment was made, so this reservation is safe to release. A
+            // timeout or transport error above is ambiguous and intentionally
+            // remains reserved to avoid paying the same invoice twice.
+            if !premium {
+                state
+                    .payments
+                    .release_payment(x_forwarded_for, None, user, amount_sats)
+                    .await;
+            }
             return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
         }
 

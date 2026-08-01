@@ -34,13 +34,23 @@ pub async fn open_channel(
         anyhow::bail!("push_amount must be less than or equal to capacity");
     }
 
-    let node_pubkey_result = hex::decode(&payload.pubkey);
-    let node_pubkey = match node_pubkey_result {
-        Ok(pubkey) => pubkey,
-        Err(e) => anyhow::bail!("invalid pubkey: {}", e),
-    };
+    // Validate the public key before it can consume a payment reservation.
+    let node_pubkey =
+        hex::decode(&payload.pubkey).map_err(|e| anyhow::anyhow!("invalid pubkey: {e}"))?;
 
-    let channel_point = {
+    // Atomically check the limits and record the payment before opening.
+    // Premium users bypass the limit but are still tracked.
+    let premium = user.is_some_and(|u| u.is_premium);
+    if !premium
+        && !state
+            .payments
+            .try_reserve_payment(x_forwarded_for, None, user, payload.capacity as u64)
+            .await
+    {
+        anyhow::bail!("Too many payments");
+    }
+
+    let channel_result = async {
         let mut lightning_client = state.lightning_client.clone();
 
         if let Some(host) = payload.host {
@@ -66,16 +76,39 @@ pub async fn open_channel(
             }
         }
 
-        lightning_client
-            .open_channel_sync(lnrpc::OpenChannelRequest {
-                node_pubkey,
-                local_funding_amount: payload.capacity,
-                push_sat: payload.push_amount,
-                ..Default::default()
-            })
-            .await?
-            .into_inner()
+        Ok::<_, anyhow::Error>(
+            lightning_client
+                .open_channel_sync(lnrpc::OpenChannelRequest {
+                    node_pubkey,
+                    local_funding_amount: payload.capacity,
+                    push_sat: payload.push_amount,
+                    ..Default::default()
+                })
+                .await?
+                .into_inner(),
+        )
+    }
+    .await;
+
+    let channel_point = match channel_result {
+        Ok(channel_point) => channel_point,
+        Err(e) => {
+            if !premium {
+                state
+                    .payments
+                    .release_payment(x_forwarded_for, None, user, payload.capacity as u64)
+                    .await;
+            }
+            return Err(e);
+        }
     };
+
+    if premium {
+        state
+            .payments
+            .add_payment(x_forwarded_for, None, user, payload.capacity as u64)
+            .await;
+    }
 
     let txid = match channel_point.funding_txid {
         Some(channel_point::FundingTxid::FundingTxidBytes(mut bytes)) => {
@@ -89,11 +122,6 @@ pub async fn open_channel(
         }
         None => anyhow::bail!("failed to open channel"),
     };
-
-    state
-        .payments
-        .add_payment(x_forwarded_for, None, user, payload.capacity as u64)
-        .await;
 
     if let Some(tx) = &state.analytics_writer {
         crate::analytics::record_payment(
