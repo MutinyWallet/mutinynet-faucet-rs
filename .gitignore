@@ -1,3 +1,8 @@
 /target
+.env
 .env.local
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
 /faucet_config
