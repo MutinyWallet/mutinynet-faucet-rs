@@ -411,6 +411,31 @@ async fn github_device(
     Extension(state): Extension<AppState>,
     Json(params): Json<GithubCallback>,
 ) -> Result<Json<DeviceReturn>, StatusCode> {
+    // Verify the token was issued to *this* OAuth app. Without this check,
+    // any GitHub token with email scope (e.g. harvested from an unrelated
+    // app) could be exchanged for a faucet JWT in the victim's name.
+    let check = state
+        .auth
+        .client
+        .post(format!(
+            "https://api.github.com/applications/{}/token",
+            state.auth.github_client_id
+        ))
+        .basic_auth(
+            &state.auth.github_client_id,
+            Some(&state.auth.github_client_secret),
+        )
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "rust-github-oauth")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&json!({ "access_token": params.code }))
+        .send()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !check.status().is_success() {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
     // Get user info
     // Get user's email
     let user_emails = state
