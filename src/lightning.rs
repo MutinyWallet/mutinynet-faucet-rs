@@ -11,6 +11,7 @@ use nostr::{EventBuilder, Filter, JsonUtil, Kind, Metadata, RelayUrl};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
+use tonic_openssl_lnd::routerrpc;
 
 use crate::auth::AuthUser;
 use crate::nostr_dms::RELAYS;
@@ -19,6 +20,15 @@ use crate::{AppState, MAX_SEND_AMOUNT};
 
 /// Max send amount in millisatoshis (`MAX_SEND_AMOUNT` is in sats).
 const MAX_SEND_AMOUNT_MSATS: u64 = MAX_SEND_AMOUNT * 1_000;
+const PAYMENT_TIMEOUT_SECONDS: i32 = 60;
+const SMALL_PAYMENT_FEE_THRESHOLD_MSAT: u64 = 1_000_000;
+const DEFAULT_ROUTING_FEE_PERCENT: u64 = 5;
+
+#[derive(Debug)]
+pub(crate) enum PaymentOutcome {
+    Succeeded(String),
+    Failed(String),
+}
 
 /// Parse an LNURL fetch URL and reject unsafe schemes and IP literals.
 fn validate_fetch_url(url_str: &str) -> anyhow::Result<url::Url> {
@@ -267,56 +277,40 @@ pub async fn pay_lightning(
         anyhow::bail!("invalid bolt11")
     };
 
-    let payment_preimage = {
-        let mut lightning_client = state.lightning_client.clone();
+    info!("Paying invoice {}", invoice.payment_hash());
 
-        info!("Paying invoice {}", invoice.payment_hash());
+    let amount_sats = invoice_amount_sats(&invoice)?;
 
-        let amount_sats = invoice_amount_sats(&invoice)?;
-
-        // Atomically check the limits and record the payment before paying.
-        // Premium users bypass the limit but are still tracked.
-        let premium = user.is_some_and(|u| u.is_premium);
-        if premium {
-            state
-                .payments
-                .add_payment(x_forwarded_for, None, user, amount_sats)
-                .await;
-        } else if !state
+    // Atomically check the limits and record the payment before paying.
+    // Premium users bypass the limit but are still tracked.
+    let premium = user.is_some_and(|u| u.is_premium);
+    if premium {
+        state
             .payments
-            .try_reserve_payment(x_forwarded_for, None, user, amount_sats)
-            .await
-        {
-            anyhow::bail!("Too many payments");
-        }
-
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            lightning_client.send_payment_sync(lnrpc::SendRequest {
-                payment_request: invoice.to_string(),
-                allow_self_payment: true,
-                ..Default::default()
-            }),
-        )
+            .add_payment(x_forwarded_for, None, user, amount_sats)
+            .await;
+    } else if !state
+        .payments
+        .try_reserve_payment(x_forwarded_for, None, user, amount_sats)
         .await
-        .map_err(|_| anyhow::anyhow!("payment timed out"))??
-        .into_inner();
+    {
+        anyhow::bail!("Too many payments");
+    }
 
-        if !response.payment_error.is_empty() {
-            // LND returned a completed response that explicitly says no
-            // payment was made, so this reservation is safe to release. A
-            // timeout or transport error above is ambiguous and intentionally
-            // remains reserved to avoid paying the same invoice twice.
+    let payment_preimage = match send_bolt11_payment(state, &invoice, true).await? {
+        PaymentOutcome::Succeeded(preimage) => preimage,
+        PaymentOutcome::Failed(reason) => {
+            // LND returned a final failure, so no payment was made and the
+            // reservation is safe to release. Transport errors remain reserved
+            // because their payment outcome is ambiguous.
             if !premium {
                 state
                     .payments
                     .release_payment(x_forwarded_for, None, user, amount_sats)
                     .await;
             }
-            return Err(anyhow::anyhow!("Payment error: {}", response.payment_error));
+            anyhow::bail!("Payment failed: {reason}")
         }
-
-        response.payment_preimage
     };
 
     if let Some(tx) = &state.analytics_writer {
@@ -330,12 +324,82 @@ pub async fn pay_lightning(
         );
     }
 
-    Ok(hex::encode(payment_preimage))
+    Ok(payment_preimage)
+}
+
+pub(crate) async fn send_bolt11_payment(
+    state: &AppState,
+    invoice: &Bolt11Invoice,
+    allow_self_payment: bool,
+) -> anyhow::Result<PaymentOutcome> {
+    let request = send_payment_request(invoice, allow_self_payment)?;
+    let mut router_client = state.router_client.clone();
+    let mut updates = router_client.send_payment_v2(request).await?.into_inner();
+
+    while let Some(payment) = updates.message().await? {
+        if payment.status == lnrpc::payment::PaymentStatus::Succeeded as i32
+            || payment.status == lnrpc::payment::PaymentStatus::Failed as i32
+        {
+            return final_payment_result(payment);
+        }
+    }
+
+    anyhow::bail!("LND payment stream ended without a final status")
+}
+
+fn send_payment_request(
+    invoice: &Bolt11Invoice,
+    allow_self_payment: bool,
+) -> anyhow::Result<routerrpc::SendPaymentRequest> {
+    let amount_msat = invoice
+        .amount_milli_satoshis()
+        .ok_or_else(|| anyhow::anyhow!("bolt11 invoice should have an amount"))?;
+
+    Ok(routerrpc::SendPaymentRequest {
+        payment_request: invoice.to_string(),
+        timeout_seconds: PAYMENT_TIMEOUT_SECONDS,
+        fee_limit_msat: default_routing_fee_limit_msat(amount_msat) as i64,
+        allow_self_payment,
+        no_inflight_updates: true,
+        ..Default::default()
+    })
+}
+
+fn default_routing_fee_limit_msat(amount_msat: u64) -> u64 {
+    if amount_msat <= SMALL_PAYMENT_FEE_THRESHOLD_MSAT {
+        amount_msat
+    } else {
+        amount_msat.saturating_mul(DEFAULT_ROUTING_FEE_PERCENT) / 100
+    }
+}
+
+fn final_payment_result(payment: lnrpc::Payment) -> anyhow::Result<PaymentOutcome> {
+    if payment.status == lnrpc::payment::PaymentStatus::Succeeded as i32 {
+        if payment.payment_preimage.is_empty() {
+            anyhow::bail!("LND reported a successful payment without a preimage");
+        }
+
+        return Ok(PaymentOutcome::Succeeded(payment.payment_preimage));
+    }
+
+    if payment.status == lnrpc::payment::PaymentStatus::Failed as i32 {
+        let reason = lnrpc::PaymentFailureReason::from_i32(payment.failure_reason)
+            .map(|reason| format!("{reason:?}"))
+            .unwrap_or_else(|| format!("Unknown({})", payment.failure_reason));
+        return Ok(PaymentOutcome::Failed(reason));
+    }
+
+    anyhow::bail!(
+        "LND returned a non-final payment status: {}",
+        payment.status
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_INVOICE: &str = "lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh";
 
     #[test]
     fn rejects_non_https_and_private_ip_literals() {
@@ -357,5 +421,67 @@ mod tests {
         assert_eq!(msats_to_limit_sats(999), 1);
         assert_eq!(msats_to_limit_sats(1_000), 1);
         assert_eq!(msats_to_limit_sats(1_001), 2);
+    }
+
+    #[test]
+    fn routing_fee_limit_matches_legacy_send_payment_default() {
+        assert_eq!(default_routing_fee_limit_msat(1), 1);
+        assert_eq!(default_routing_fee_limit_msat(1_000_000), 1_000_000);
+        assert_eq!(default_routing_fee_limit_msat(1_001_000), 50_050);
+        assert_eq!(default_routing_fee_limit_msat(5_000_000_000), 250_000_000);
+    }
+
+    #[test]
+    fn send_payment_v2_request_has_safe_explicit_defaults() {
+        let invoice = Bolt11Invoice::from_str(TEST_INVOICE).unwrap();
+        let request = send_payment_request(&invoice, true).unwrap();
+
+        assert_eq!(request.payment_request, TEST_INVOICE);
+        assert_eq!(request.timeout_seconds, PAYMENT_TIMEOUT_SECONDS);
+        assert_eq!(request.fee_limit_msat, 12_500_000);
+        assert!(request.allow_self_payment);
+        assert!(request.no_inflight_updates);
+    }
+
+    #[test]
+    fn successful_payment_returns_hex_preimage_unchanged() {
+        let preimage = "01".repeat(32);
+        let payment = lnrpc::Payment {
+            status: lnrpc::payment::PaymentStatus::Succeeded as i32,
+            payment_preimage: preimage.clone(),
+            ..Default::default()
+        };
+
+        match final_payment_result(payment).unwrap() {
+            PaymentOutcome::Succeeded(actual) => assert_eq!(actual, preimage),
+            PaymentOutcome::Failed(reason) => panic!("unexpected failure: {reason}"),
+        }
+    }
+
+    #[test]
+    fn successful_payment_requires_preimage() {
+        let payment = lnrpc::Payment {
+            status: lnrpc::payment::PaymentStatus::Succeeded as i32,
+            ..Default::default()
+        };
+
+        assert!(final_payment_result(payment)
+            .unwrap_err()
+            .to_string()
+            .contains("without a preimage"));
+    }
+
+    #[test]
+    fn failed_payment_reports_lnd_failure_reason() {
+        let payment = lnrpc::Payment {
+            status: lnrpc::payment::PaymentStatus::Failed as i32,
+            failure_reason: lnrpc::PaymentFailureReason::FailureReasonNoRoute as i32,
+            ..Default::default()
+        };
+
+        match final_payment_result(payment).unwrap() {
+            PaymentOutcome::Succeeded(_) => panic!("unexpected success"),
+            PaymentOutcome::Failed(reason) => assert!(reason.contains("FailureReasonNoRoute")),
+        }
     }
 }

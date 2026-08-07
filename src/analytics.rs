@@ -941,7 +941,7 @@ pub async fn analytics_balance(
     let mut client = state.lightning_client.clone();
 
     let wallet = client
-        .wallet_balance(tonic_openssl_lnd::lnrpc::WalletBalanceRequest {})
+        .wallet_balance(tonic_openssl_lnd::lnrpc::WalletBalanceRequest::default())
         .await?
         .into_inner();
 
@@ -1101,7 +1101,7 @@ pub async fn analytics_combined(
         async {
             let mut client = state.lightning_client.clone();
             let w = client
-                .wallet_balance(tonic_openssl_lnd::lnrpc::WalletBalanceRequest {})
+                .wallet_balance(tonic_openssl_lnd::lnrpc::WalletBalanceRequest::default())
                 .await;
             let c = client
                 .channel_balance(tonic_openssl_lnd::lnrpc::ChannelBalanceRequest {})

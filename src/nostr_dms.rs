@@ -1,4 +1,6 @@
-use crate::lightning::{invoice_amount_sats, validate_invoice_amount};
+use crate::lightning::{
+    invoice_amount_sats, send_bolt11_payment, validate_invoice_amount, PaymentOutcome,
+};
 use crate::payment_instructions::parse_payment_instructions;
 use crate::{AppState, MAX_SEND_AMOUNT};
 use bitcoin::Amount;
@@ -94,24 +96,12 @@ async fn pay_invoice(
     }
 
     info!("Paying invoice {} from nostr dm", invoice.payment_hash());
-    let mut lightning_client = state.lightning_client.clone();
 
     let payment_result = async {
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            lightning_client.send_payment_sync(lnrpc::SendRequest {
-                payment_request: invoice.to_string(),
-                ..Default::default()
-            }),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("payment timed out"))??
-        .into_inner();
-
-        if !response.payment_error.is_empty() {
-            anyhow::bail!("Payment error: {}", response.payment_error);
+        match send_bolt11_payment(state, &invoice, false).await? {
+            PaymentOutcome::Succeeded(_) => Ok(()),
+            PaymentOutcome::Failed(reason) => anyhow::bail!("Payment failed: {reason}"),
         }
-        Ok::<_, anyhow::Error>(response)
     }
     .await;
 

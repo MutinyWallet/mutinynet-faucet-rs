@@ -25,7 +25,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tonic_openssl_lnd::LndLightningClient;
+use tonic_openssl_lnd::{LndLightningClient, LndRouterClient};
 use tower_http::cors::{AllowMethods, CorsLayer};
 
 use crate::admin::{admin_add, admin_list, admin_remove};
@@ -68,6 +68,7 @@ pub struct AppState {
     keys: Keys,
     network: bitcoin::Network,
     lightning_client: LndLightningClient,
+    router_client: LndRouterClient,
     mainnet_lightning_client: Option<LndLightningClient>,
     bitcoin_rpc: Option<Arc<bitcoincore_rpc::Client>>,
     reorg_db: Option<SqlitePool>,
@@ -110,6 +111,7 @@ impl AppState {
         host: String,
         keys: Keys,
         lightning_client: LndLightningClient,
+        router_client: LndRouterClient,
         mainnet_lightning_client: Option<LndLightningClient>,
         bitcoin_rpc: Option<Arc<bitcoincore_rpc::Client>>,
         reorg_db: Option<SqlitePool>,
@@ -131,6 +133,7 @@ impl AppState {
             keys,
             network,
             lightning_client,
+            router_client,
             mainnet_lightning_client,
             bitcoin_rpc,
             reorg_db,

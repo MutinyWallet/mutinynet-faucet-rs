@@ -56,7 +56,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
     println!("network: {:?}", network);
 
     // Setup lightning stuff
-    let lightning_client = {
+    let (lightning_client, router_client) = {
         let address = env::var("GRPC_HOST").expect("missing GRPC_HOST");
         let macaroon_file = env::var("ADMIN_MACAROON_PATH").expect("missing ADMIN_MACAROON_PATH");
         let cert_file = env::var("TLS_CERT_PATH").expect("missing TLS_CERT_PATH");
@@ -70,6 +70,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
             .expect("failed to connect");
 
         let lightning_client = lnd.lightning().clone();
+        let router_client = lnd.router().clone();
 
         // Make sure we can get info at startup
         let _ = lightning_client
@@ -79,7 +80,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
             .expect("failed to get info")
             .into_inner();
 
-        lightning_client
+        (lightning_client, router_client)
     };
 
     let auth = AuthState {
@@ -146,10 +147,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
                     .into_inner();
 
                 // Verify this is actually mainnet
-                let is_mainnet = info
-                    .chains
-                    .iter()
-                    .any(|chain| chain.chain == "bitcoin" && chain.network == "mainnet");
+                let is_mainnet = info.chains.iter().any(|chain| chain.network == "mainnet");
 
                 if !is_mainnet {
                     panic!(
@@ -324,6 +322,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
         host,
         keys,
         lightning_client,
+        router_client,
         mainnet_lightning_client,
         bitcoin_rpc,
         reorg_db,
