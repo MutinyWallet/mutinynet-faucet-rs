@@ -10,6 +10,7 @@ use tonic_openssl_lnd::lnrpc;
 use crate::analytics::{init_analytics_db, start_write_batcher};
 use crate::auth::{init_users_db, AuthState, UsersCache};
 use crate::l402::L402Config;
+use crate::monitoring::{start_payment_volume_monitor, MonitoringHealth, PaymentAlertConfig};
 use crate::reorg::init_reorg_db;
 use crate::{AppState, ReorgConfig};
 
@@ -272,13 +273,16 @@ pub async fn setup() -> anyhow::Result<AppState> {
     let users_cache = UsersCache::load(&users_db).await?;
     info!("Users database initialized at {}", users_db_path);
 
+    let payment_alert_config = PaymentAlertConfig::from_env()?;
+    let monitoring_health = MonitoringHealth::new(payment_alert_config.is_some());
+
     // Initialize analytics database
     let analytics_db_path =
         env::var("ANALYTICS_DB_PATH").unwrap_or_else(|_| "analytics.db".to_string());
     let (analytics_db, analytics_writer) = match init_analytics_db(&analytics_db_path).await {
         Ok(pool) => {
             info!("Analytics database initialized at {}", analytics_db_path);
-            let writer = start_write_batcher(pool.clone());
+            let writer = start_write_batcher(pool.clone(), monitoring_health.clone());
             (Some(pool), Some(writer))
         }
         Err(e) => {
@@ -289,6 +293,14 @@ pub async fn setup() -> anyhow::Result<AppState> {
             (None, None)
         }
     };
+
+    match (&analytics_db, payment_alert_config) {
+        (Some(pool), Some(config)) => {
+            start_payment_volume_monitor(pool.clone(), config, monitoring_health.clone())
+        }
+        (None, Some(_)) => anyhow::bail!("Payment alerts require the analytics database"),
+        (_, None) => info!("Payment alerts are disabled"),
+    }
 
     let admin_token = env::var("ADMIN_TOKEN").ok();
     match &admin_token {
@@ -336,6 +348,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
         analytics_db,
         analytics_writer,
         analytics_token,
+        monitoring_health,
         arkade_daemon_url,
         arkade_internal_token,
     ))

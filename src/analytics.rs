@@ -1,6 +1,6 @@
 use axum::extract::Query;
 use axum::{Extension, Json};
-use log::error;
+use log::{error, info};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePoolOptions;
@@ -8,6 +8,7 @@ use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
+use crate::monitoring::MonitoringHealth;
 use crate::AppError;
 
 pub async fn init_analytics_db(path: &str) -> anyhow::Result<SqlitePool> {
@@ -110,7 +111,7 @@ pub async fn init_analytics_db(path: &str) -> anyhow::Result<SqlitePool> {
     Ok(pool)
 }
 
-pub struct AnalyticsPayment {
+struct AnalyticsPayment {
     payment_type: String,
     amount_sats: i64,
     username: Option<String>,
@@ -118,13 +119,20 @@ pub struct AnalyticsPayment {
     destination: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct AnalyticsWriter {
+    sender: mpsc::UnboundedSender<AnalyticsPayment>,
+    health: MonitoringHealth,
+}
+
 /// Starts a background writer that batches inserts to reduce SQLite write contention.
-/// Returns a sender that `record_payment` uses to enqueue writes.
-pub fn start_write_batcher(pool: SqlitePool) -> mpsc::UnboundedSender<AnalyticsPayment> {
+/// Returns a writer that `record_payment` uses to enqueue writes.
+pub fn start_write_batcher(pool: SqlitePool, health: MonitoringHealth) -> AnalyticsWriter {
     let (tx, mut rx) = mpsc::unbounded_channel::<AnalyticsPayment>();
+    let task_health = health.clone();
 
     tokio::spawn(async move {
-        // Collect up to 64 records or 500ms, whichever comes first
+        // Write one record plus up to 63 records that are already queued.
         let mut buf: Vec<AnalyticsPayment> = Vec::with_capacity(64);
 
         loop {
@@ -141,18 +149,39 @@ pub fn start_write_batcher(pool: SqlitePool) -> mpsc::UnboundedSender<AnalyticsP
                 }
             }
 
-            // Batch insert in a single transaction
-            if let Err(e) = flush_batch(&pool, &buf).await {
-                error!(
-                    "Failed to flush analytics batch ({} records): {e}",
-                    buf.len()
-                );
+            // Keep this batch until SQLite stores it. This prevents a
+            // transient database error from creating a monitoring gap.
+            let mut retry_delay = std::time::Duration::from_secs(1);
+            loop {
+                match flush_batch(&pool, &buf).await {
+                    Ok(()) => {
+                        if !task_health.analytics_writer_healthy() {
+                            info!("The analytics writer recovered");
+                        }
+                        task_health.set_analytics_writer_healthy(true);
+                        break;
+                    }
+                    Err(e) => {
+                        task_health.set_analytics_writer_healthy(false);
+                        error!(
+                            "The analytics writer failed for {} records: {e}. It will retry in {} seconds",
+                            buf.len(),
+                            retry_delay.as_secs()
+                        );
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
+                    }
+                }
             }
             buf.clear();
         }
+
+        task_health.set_analytics_writer_healthy(false);
+        error!("The analytics writer stopped");
     });
 
-    tx
+    health.set_analytics_writer_healthy(true);
+    AnalyticsWriter { sender: tx, health }
 }
 
 async fn flush_batch(pool: &SqlitePool, records: &[AnalyticsPayment]) -> Result<(), sqlx::Error> {
@@ -174,20 +203,27 @@ async fn flush_batch(pool: &SqlitePool, records: &[AnalyticsPayment]) -> Result<
 }
 
 pub fn record_payment(
-    tx: &mpsc::UnboundedSender<AnalyticsPayment>,
+    writer: &AnalyticsWriter,
     payment_type: &str,
     amount_sats: u64,
     username: Option<&str>,
     ip_address: &str,
     destination: Option<&str>,
 ) {
-    let _ = tx.send(AnalyticsPayment {
-        payment_type: payment_type.to_string(),
-        amount_sats: amount_sats as i64,
-        username: username.map(|s| s.to_string()),
-        ip_address: ip_address.to_string(),
-        destination: destination.map(|s| s.to_string()),
-    });
+    if writer
+        .sender
+        .send(AnalyticsPayment {
+            payment_type: payment_type.to_string(),
+            amount_sats: amount_sats as i64,
+            username: username.map(|s| s.to_string()),
+            ip_address: ip_address.to_string(),
+            destination: destination.map(|s| s.to_string()),
+        })
+        .is_err()
+    {
+        writer.health.set_analytics_writer_healthy(false);
+        error!("The analytics writer stopped before it stored a payment record");
+    }
 }
 
 /// Records an L402 invoice issuance.
@@ -240,6 +276,67 @@ pub fn record_l402_paid(pool: &SqlitePool, payment_hash: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn writer_retries_a_failed_batch_without_losing_it() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE faucet_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                payment_type TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                username TEXT,
+                ip_address TEXT NOT NULL,
+                destination TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER reject_payment BEFORE INSERT ON faucet_payments
+             BEGIN SELECT RAISE(FAIL, 'temporary failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let health = MonitoringHealth::new(false);
+        let writer = start_write_batcher(pool.clone(), health.clone());
+        record_payment(&writer, "lightning", 500, None, "127.0.0.1", None);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while health.analytics_writer_healthy() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        sqlx::query("DROP TRIGGER reject_payment")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !health.analytics_writer_healthy() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM faucet_payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
 
     #[tokio::test]
     async fn issued_write_repairs_paid_first_placeholder_amount() {

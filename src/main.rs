@@ -24,17 +24,18 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{oneshot, Mutex};
 use tonic_openssl_lnd::{LndLightningClient, LndRouterClient};
 use tower_http::cors::{AllowMethods, CorsLayer};
 
 use crate::admin::{admin_add, admin_list, admin_remove};
 use crate::analytics::{
     analytics_balance, analytics_combined, analytics_domains, analytics_l402, analytics_recent,
-    analytics_summary, analytics_timeseries, analytics_users, user_recent,
+    analytics_summary, analytics_timeseries, analytics_users, user_recent, AnalyticsWriter,
 };
 use crate::arkade::{dispense_arkade, ArkadeRequest, ArkadeResponse};
 use crate::auth::{auth_middleware, AuthState, AuthUser, GithubCallback, UsersCache};
+use crate::monitoring::{monitoring_health_handler, MonitoringHealth};
 use crate::nostr_dms::listen_to_nostr_dms;
 use crate::payments::PaymentsByIp;
 use bolt11::{request_bolt11, Bolt11Request, Bolt11Response};
@@ -55,6 +56,7 @@ mod bolt11;
 mod channel;
 mod l402;
 mod lightning;
+mod monitoring;
 mod nostr_dms;
 mod onchain;
 mod payment_instructions;
@@ -88,9 +90,11 @@ pub struct AppState {
     /// Pool for read queries (dashboard endpoints)
     pub analytics_db: Option<SqlitePool>,
     /// Batched writer channel for recording payments
-    pub analytics_writer: Option<mpsc::UnboundedSender<analytics::AnalyticsPayment>>,
+    pub analytics_writer: Option<AnalyticsWriter>,
     /// API token for analytics endpoints
     pub analytics_token: Option<String>,
+    /// Health state for analytics storage and Telegram alerts.
+    pub monitoring_health: MonitoringHealth,
     /// Base URL of the Arkade dispenser daemon on the internal network.
     /// If unset, POST /api/arkade returns an error.
     pub arkade_daemon_url: Option<String>,
@@ -123,8 +127,9 @@ impl AppState {
         users_cache: Arc<UsersCache>,
         admin_token: Option<String>,
         analytics_db: Option<SqlitePool>,
-        analytics_writer: Option<mpsc::UnboundedSender<analytics::AnalyticsPayment>>,
+        analytics_writer: Option<AnalyticsWriter>,
         analytics_token: Option<String>,
+        monitoring_health: MonitoringHealth,
         arkade_daemon_url: Option<String>,
         arkade_internal_token: Option<String>,
     ) -> Self {
@@ -148,6 +153,7 @@ impl AppState {
             analytics_db,
             analytics_writer,
             analytics_token,
+            monitoring_health,
             arkade_daemon_url,
             arkade_internal_token,
         }
@@ -241,6 +247,11 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/api/analytics/balance",
             get(analytics_balance).route_layer(middleware::from_fn(analytics_auth_middleware)),
+        )
+        .route(
+            "/api/analytics/monitoring/health",
+            get(monitoring_health_handler)
+                .route_layer(middleware::from_fn(analytics_auth_middleware)),
         )
         .route(
             "/api/analytics",

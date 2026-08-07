@@ -11,6 +11,53 @@ The faucet records every payment to a local SQLite database and exposes read-onl
 
 The database is created automatically on startup. No migration steps are needed.
 
+## Telegram payment alerts
+
+The faucet can send an alert when outgoing payment volume reaches a limit. The alert uses the same analytics database.
+
+Set these environment variables:
+
+| Environment Variable | Default | Description |
+|---|---:|---|
+| `PAYMENT_ALERT_THRESHOLD_SATS` | _(none)_ | Volume limit in sats. This value enables the alert. |
+| `TELEGRAM_BOT_TOKEN` | _(none)_ | Token from BotFather. This value is required when the alert is enabled. |
+| `TELEGRAM_CHAT_ID` | _(none)_ | Telegram chat ID that receives the alert. |
+| `PAYMENT_ALERT_WINDOW_SECONDS` | `3600` | Length of the rolling volume window. |
+| `PAYMENT_ALERT_CHECK_INTERVAL_SECONDS` | `60` | Time between volume checks. |
+| `PAYMENT_ALERT_COOLDOWN_SECONDS` | `3600` | Minimum time between repeated alerts while volume stays high. |
+
+The volume includes successful outgoing payments and channel opens. Generated `bolt11` invoices do not count as outgoing payments.
+
+The faucet sends an alert when the volume first reaches the limit. It sends another alert after the cooldown if the volume stays high.
+
+The faucet sends a startup message to make sure that the bot can write to the configured chat. It checks Telegram during each interval.
+
+If a database write fails, the analytics writer keeps the payment records and retries. Telegram reports a persistent failure and its recovery.
+
+If payment alerts are enabled, the faucet does not start without the analytics database.
+
+To configure Telegram:
+
+1. Create a bot with BotFather and copy its token.
+2. Send a message to the new bot.
+3. Get the chat ID from `https://api.telegram.org/bot<token>/getUpdates`.
+4. Set the variables and restart the faucet.
+
+### Monitoring health
+
+`GET /api/analytics/monitoring/health` reports the state of the analytics writer and Telegram. This endpoint requires the analytics Bearer token.
+
+The endpoint returns `503 Service Unavailable` when a configured monitoring component is degraded.
+
+```json
+{
+  "status": "healthy",
+  "alerts_configured": true,
+  "analytics_writer": "healthy",
+  "telegram": "healthy"
+}
+```
+
 ## Authentication
 
 All analytics endpoints require a Bearer token matching the `ANALYTICS_TOKEN` environment variable:
