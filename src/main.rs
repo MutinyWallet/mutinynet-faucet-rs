@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::signal::unix::{signal, SignalKind};
@@ -100,6 +100,10 @@ pub struct AppState {
     pub arkade_daemon_url: Option<String>,
     /// Optional shared secret sent to the daemon as X-Internal-Token.
     pub arkade_internal_token: Option<String>,
+    /// The container's default gateway, trusted as a proxy peer alongside
+    /// loopback (docker-proxy hairpins host traffic, so nginx arrives with
+    /// the gateway IP as its peer). None outside containers: loopback only.
+    pub trusted_gateway: Option<IpAddr>,
 }
 
 #[derive(Clone)]
@@ -132,6 +136,7 @@ impl AppState {
         monitoring_health: MonitoringHealth,
         arkade_daemon_url: Option<String>,
         arkade_internal_token: Option<String>,
+        trusted_gateway: Option<IpAddr>,
     ) -> Self {
         AppState {
             host,
@@ -156,6 +161,7 @@ impl AppState {
             monitoring_health,
             arkade_daemon_url,
             arkade_internal_token,
+            trusted_gateway,
         }
     }
 }
@@ -615,7 +621,7 @@ async fn onchain_handler(
     headers: HeaderMap,
     Json(payload): Json<OnchainRequest>,
 ) -> Result<Json<OnchainResponse>, AppError> {
-    let x_forwarded_for = client_ip(&headers, peer);
+    let x_forwarded_for = client_ip(&headers, peer, state.trusted_gateway);
 
     let res = pay_onchain(&state, &x_forwarded_for, user, payload).await?;
 
@@ -630,7 +636,7 @@ async fn lightning_handler(
     headers: HeaderMap,
     Json(payload): Json<LightningRequest>,
 ) -> Result<Json<LightningResponse>, AppError> {
-    let x_forwarded_for = client_ip(&headers, peer);
+    let x_forwarded_for = client_ip(&headers, peer, state.trusted_gateway);
 
     let payment_hash =
         pay_lightning(&state, &x_forwarded_for, Some(&user), &payload.bolt11).await?;
@@ -644,7 +650,10 @@ async fn lnurlw_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<WithdrawalResponse>, AppError> {
-    let key = format!("lnurlw:{}", client_ip(&headers, peer));
+    let key = format!(
+        "lnurlw:{}",
+        client_ip(&headers, peer, state.trusted_gateway)
+    );
     if !state
         .payments
         .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
@@ -700,7 +709,7 @@ async fn lnurlw_callback_handler(
     headers: HeaderMap,
     Query(payload): Query<LnurlWithdrawParams>,
 ) -> Result<Json<Value>, Json<Value>> {
-    let x_forwarded_for = client_ip(&headers, peer);
+    let x_forwarded_for = client_ip(&headers, peer, state.trusted_gateway);
 
     // Consume the k1: it must exist, be unexpired, and is single-use.
     let cutoff = chrono::Utc::now().timestamp() - CHALLENGE_TTL.as_secs() as i64;
@@ -777,7 +786,7 @@ async fn l402_challenge_handler(
 ) -> Result<Response, AppError> {
     // Unauthenticated invoice creation is rate-limited per IP to protect
     // the (mainnet) LND node from invoice spam.
-    let key = format!("l402:{}", client_ip(&headers, peer));
+    let key = format!("l402:{}", client_ip(&headers, peer, state.trusted_gateway));
     if !state
         .payments
         .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
@@ -810,7 +819,7 @@ async fn l402_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<L402HandlerResponse>, AppError> {
-    let key = format!("l402:{}", client_ip(&headers, peer));
+    let key = format!("l402:{}", client_ip(&headers, peer, state.trusted_gateway));
     if !state
         .payments
         .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
@@ -840,7 +849,10 @@ async fn l402_check_handler(
     }
 
     // Each check hits LND lookup_invoice; rate-limit per IP.
-    let key = format!("l402check:{}", client_ip(&headers, peer));
+    let key = format!(
+        "l402check:{}",
+        client_ip(&headers, peer, state.trusted_gateway)
+    );
     if !state
         .payments
         .try_reserve(&[(&key, L402_CHECK_DAILY_LIMIT)], 1)
@@ -906,7 +918,10 @@ async fn bolt11_handler(
 ) -> Result<Json<Bolt11Response>, AppError> {
     // Unauthenticated invoice creation is rate-limited per IP to protect
     // the LND node from invoice spam.
-    let key = format!("bolt11:{}", client_ip(&headers, peer));
+    let key = format!(
+        "bolt11:{}",
+        client_ip(&headers, peer, state.trusted_gateway)
+    );
     if !state
         .payments
         .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
@@ -928,7 +943,7 @@ async fn channel_handler(
     headers: HeaderMap,
     Json(payload): Json<ChannelRequest>,
 ) -> Result<Json<ChannelResponse>, AppError> {
-    let x_forwarded_for = client_ip(&headers, peer);
+    let x_forwarded_for = client_ip(&headers, peer, state.trusted_gateway);
 
     let txid = open_channel(&state, &x_forwarded_for, Some(&user), payload).await?;
 
@@ -959,7 +974,7 @@ async fn limits_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<LimitsResponse>, AppError> {
-    let x_forwarded_for = client_ip(&headers, peer);
+    let x_forwarded_for = client_ip(&headers, peer, state.trusted_gateway);
 
     let (ip_used, user_used) = state
         .payments
@@ -991,7 +1006,7 @@ async fn arkade_handler(
     headers: HeaderMap,
     Json(payload): Json<ArkadeRequest>,
 ) -> Result<Json<ArkadeResponse>, AppError> {
-    let x_forwarded_for = client_ip(&headers, peer);
+    let x_forwarded_for = client_ip(&headers, peer, state.trusted_gateway);
 
     let res = dispense_arkade(&state, &x_forwarded_for, &user, payload).await?;
     Ok(Json(res))
@@ -1010,14 +1025,14 @@ async fn reorg_invoice_handler(
 /// Extract the client identity used for rate limiting.
 ///
 /// The TCP peer address is the identity by default. `X-Forwarded-For` is
-/// only honored when the direct peer is loopback, i.e. the request came
-/// through the local nginx proxy, which sets
-/// `X-Forwarded-For: $proxy_add_x_forwarded_for` with the real client IP as
-/// the rightmost entry. Any earlier entries are client-supplied and must not
-/// be trusted, so only the rightmost entry is used. Direct connections from
-/// any other peer ignore the header entirely.
-fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
-    if peer.ip().is_loopback() {
+/// only honored when the peer is a trusted proxy (loopback or the
+/// container's default gateway, where the local nginx proxy arrives from).
+/// nginx sets `X-Forwarded-For: $proxy_add_x_forwarded_for` with the real
+/// client IP as the rightmost entry. Any earlier entries are
+/// client-supplied and must not be trusted, so only the rightmost entry is
+/// used. Direct connections from any other peer ignore the header entirely.
+fn client_ip(headers: &HeaderMap, peer: SocketAddr, gateway: Option<IpAddr>) -> String {
+    if is_trusted_proxy(&peer.ip(), gateway) {
         if let Some(xff) = headers
             .get("x-forwarded-for")
             .and_then(|x| HeaderValue::to_str(x).ok())
@@ -1029,6 +1044,44 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
         }
     }
     peer.ip().to_string()
+}
+
+/// X-Forwarded-For is only trusted when it comes from the local nginx
+/// proxy: a loopback peer, or the container's default gateway (docker-proxy
+/// hairpins host traffic, so nginx arrives with the gateway IP as its
+/// peer). Do not broaden this to whole private ranges.
+fn is_trusted_proxy(peer: &IpAddr, gateway: Option<IpAddr>) -> bool {
+    peer.is_loopback() || gateway.is_some_and(|gateway| gateway == *peer)
+}
+
+/// Read the container's default gateway from /proc/net/route.
+///
+/// Returns None when there is no default route or the file cannot be
+/// parsed (e.g. local dev outside a container); callers then trust
+/// loopback only. Never fails.
+fn default_gateway() -> Option<IpAddr> {
+    let contents = std::fs::read_to_string("/proc/net/route").ok()?;
+    parse_default_gateway(&contents)
+}
+
+/// Parse the default gateway from /proc/net/route contents: the gateway
+/// field on the line whose destination is 00000000, as a little-endian hex
+/// IPv4 address.
+fn parse_default_gateway(contents: &str) -> Option<IpAddr> {
+    for line in contents.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 || fields[1] != "00000000" {
+            continue;
+        }
+        let Ok(raw) = u32::from_str_radix(fields[2], 16) else {
+            continue;
+        };
+        if raw == 0 {
+            continue;
+        }
+        return Some(IpAddr::V4(Ipv4Addr::from(raw.to_le_bytes())));
+    }
+    None
 }
 
 // Make our own error that wraps `anyhow::Error`.
@@ -1151,17 +1204,33 @@ mod tests {
             HeaderValue::from_static("1.2.3.4, 203.0.113.66"),
         );
         let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
-        assert_eq!(client_ip(&headers, peer), "203.0.113.66");
+        assert_eq!(client_ip(&headers, peer, None), "203.0.113.66");
     }
 
-    /// A spoofed X-Forwarded-For header from a direct (non-loopback) peer
-    /// must not become the rate-limit identity: the TCP peer address wins.
+    /// docker-proxy hairpins nginx traffic, so nginx arrives with the
+    /// container's default gateway as its peer. XFF is trusted from there.
     #[test]
-    fn spoofed_xff_from_direct_peer_is_ignored() {
+    fn xff_from_gateway_peer_is_used_as_identity() {
+        let gateway = Some(IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)));
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.66"));
+        let peer = SocketAddr::from(([172, 18, 0, 1], 12345));
+        assert_eq!(client_ip(&headers, peer, gateway), "203.0.113.66");
+    }
+
+    /// A spoofed X-Forwarded-For header from a direct (untrusted) peer must
+    /// not become the rate-limit identity: the TCP peer address wins.
+    #[test]
+    fn spoofed_xff_from_direct_peer_is_ignored() {
+        let gateway = Some(IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.66"));
+        // Another container on the same bridge is not the gateway.
+        let peer = SocketAddr::from(([172, 18, 0, 5], 12345));
+        assert_eq!(client_ip(&headers, peer, gateway), "172.18.0.5");
+        // A public peer is not trusted either.
         let peer = SocketAddr::from(([198, 51, 100, 7], 12345));
-        assert_eq!(client_ip(&headers, peer), "198.51.100.7");
+        assert_eq!(client_ip(&headers, peer, gateway), "198.51.100.7");
     }
 
     /// Without XFF, a loopback peer falls back to its own address.
@@ -1169,7 +1238,56 @@ mod tests {
     fn loopback_peer_without_xff_uses_peer_address() {
         let headers = HeaderMap::new();
         let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
-        assert_eq!(client_ip(&headers, peer), "127.0.0.1");
+        assert_eq!(client_ip(&headers, peer, None), "127.0.0.1");
+    }
+
+    #[test]
+    fn trusted_proxy_covers_loopback_and_exact_gateway_only() {
+        let gateway = Some(IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)));
+        assert!(is_trusted_proxy(&IpAddr::V4(Ipv4Addr::LOCALHOST), gateway));
+        assert!(is_trusted_proxy(
+            &IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            gateway
+        ));
+        assert!(is_trusted_proxy(
+            &IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            gateway
+        ));
+        // Other private IPs on the same bridge are not trusted.
+        assert!(!is_trusted_proxy(
+            &IpAddr::V4(Ipv4Addr::new(172, 18, 0, 5)),
+            gateway
+        ));
+        assert!(!is_trusted_proxy(
+            &IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            gateway
+        ));
+        // Without a detected gateway, only loopback is trusted.
+        assert!(is_trusted_proxy(&IpAddr::V4(Ipv4Addr::LOCALHOST), None));
+        assert!(!is_trusted_proxy(
+            &IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            None
+        ));
+    }
+
+    #[test]
+    fn parses_default_gateway_from_route_table() {
+        let fixture =
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+                       eth0\t00000000\t0102A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+                       eth0\t0002A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(
+            parse_default_gateway(fixture),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 1)))
+        );
+    }
+
+    #[test]
+    fn no_default_route_yields_no_gateway() {
+        let fixture =
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+                       eth0\t0002A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(parse_default_gateway(fixture), None);
     }
 
     /// Rotating spoofed XFF values from a direct peer all collapse to the
@@ -1186,7 +1304,7 @@ mod tests {
                     "x-forwarded-for",
                     HeaderValue::from_str(&format!("203.0.113.{i}")).unwrap(),
                 );
-                client_ip(&headers, peer)
+                client_ip(&headers, peer, None)
             })
             .collect();
         assert!(identities.iter().all(|id| id == "198.51.100.7"));

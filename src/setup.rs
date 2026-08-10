@@ -330,6 +330,15 @@ pub async fn setup() -> anyhow::Result<AppState> {
         None => warn!("ARKADE_DAEMON_URL not set — /api/arkade will return an error"),
     }
 
+    // Trust X-Forwarded-For from the local nginx proxy only. nginx arrives
+    // via docker-proxy with the container's default gateway as its peer;
+    // when no gateway can be detected (local dev), trust loopback only.
+    let trusted_gateway = crate::default_gateway();
+    match &trusted_gateway {
+        Some(ip) => info!("Trusting X-Forwarded-For from loopback and gateway {ip}"),
+        None => info!("No default gateway found; trusting X-Forwarded-For from loopback only"),
+    }
+
     Ok(AppState::new(
         host,
         keys,
@@ -351,5 +360,6 @@ pub async fn setup() -> anyhow::Result<AppState> {
         monitoring_health,
         arkade_daemon_url,
         arkade_internal_token,
+        trusted_gateway,
     ))
 }
