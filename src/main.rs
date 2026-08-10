@@ -1,4 +1,4 @@
-use axum::extract::Query;
+use axum::extract::{ConnectInfo, Query};
 use axum::headers::{HeaderMap, HeaderValue};
 use axum::http::Request;
 use axum::middleware::Next;
@@ -343,7 +343,8 @@ async fn main() -> anyhow::Result<()> {
     let addr = SocketAddr::from(([0, 0, 0, 0], 3001));
     println!("listening on {}", addr);
 
-    let server = axum::Server::bind(&addr).serve(app.into_make_service());
+    let server =
+        axum::Server::bind(&addr).serve(app.into_make_service_with_connect_info::<SocketAddr>());
 
     let graceful = server.with_graceful_shutdown(async {
         let _ = rx.await;
@@ -610,13 +611,13 @@ async fn auth_check(
 async fn onchain_handler(
     Extension(state): Extension<AppState>,
     Extension(user): Extension<AuthUser>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<OnchainRequest>,
 ) -> Result<Json<OnchainResponse>, AppError> {
-    // Extract the X-Forwarded-For header
-    let x_forwarded_for = client_ip(&headers);
+    let x_forwarded_for = client_ip(&headers, peer);
 
-    let res = pay_onchain(&state, x_forwarded_for, user, payload).await?;
+    let res = pay_onchain(&state, &x_forwarded_for, user, payload).await?;
 
     Ok(Json(res))
 }
@@ -625,13 +626,14 @@ async fn onchain_handler(
 async fn lightning_handler(
     Extension(state): Extension<AppState>,
     Extension(user): Extension<AuthUser>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<LightningRequest>,
 ) -> Result<Json<LightningResponse>, AppError> {
-    // Extract the X-Forwarded-For header
-    let x_forwarded_for = client_ip(&headers);
+    let x_forwarded_for = client_ip(&headers, peer);
 
-    let payment_hash = pay_lightning(&state, x_forwarded_for, Some(&user), &payload.bolt11).await?;
+    let payment_hash =
+        pay_lightning(&state, &x_forwarded_for, Some(&user), &payload.bolt11).await?;
 
     Ok(Json(LightningResponse { payment_hash }))
 }
@@ -639,9 +641,10 @@ async fn lightning_handler(
 #[axum::debug_handler]
 async fn lnurlw_handler(
     Extension(state): Extension<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<WithdrawalResponse>, AppError> {
-    let key = format!("lnurlw:{}", client_ip(&headers));
+    let key = format!("lnurlw:{}", client_ip(&headers, peer));
     if !state
         .payments
         .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
@@ -693,11 +696,11 @@ pub struct LnurlWithdrawParams {
 #[axum::debug_handler]
 async fn lnurlw_callback_handler(
     Extension(state): Extension<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(payload): Query<LnurlWithdrawParams>,
 ) -> Result<Json<Value>, Json<Value>> {
-    // Extract the X-Forwarded-For header
-    let x_forwarded_for = client_ip(&headers);
+    let x_forwarded_for = client_ip(&headers, peer);
 
     // Consume the k1: it must exist, be unexpired, and is single-use.
     let cutoff = chrono::Utc::now().timestamp() - CHALLENGE_TTL.as_secs() as i64;
@@ -721,7 +724,7 @@ async fn lnurlw_callback_handler(
     }
 
     // The rate limit is enforced atomically inside pay_lightning.
-    pay_lightning(&state, x_forwarded_for, None, &payload.pr)
+    pay_lightning(&state, &x_forwarded_for, None, &payload.pr)
         .await
         .map_err(|e| Json(json!({"status": "ERROR", "reason": format!("{e}")})))?;
     Ok(Json(json!({"status": "OK"})))
@@ -769,11 +772,12 @@ async fn generate_l402_challenge(state: &AppState) -> Result<L402HandlerResponse
 #[axum::debug_handler]
 async fn l402_challenge_handler(
     Extension(state): Extension<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     // Unauthenticated invoice creation is rate-limited per IP to protect
     // the (mainnet) LND node from invoice spam.
-    let key = format!("l402:{}", client_ip(&headers));
+    let key = format!("l402:{}", client_ip(&headers, peer));
     if !state
         .payments
         .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
@@ -803,9 +807,10 @@ async fn l402_challenge_handler(
 #[axum::debug_handler]
 async fn l402_handler(
     Extension(state): Extension<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<L402HandlerResponse>, AppError> {
-    let key = format!("l402:{}", client_ip(&headers));
+    let key = format!("l402:{}", client_ip(&headers, peer));
     if !state
         .payments
         .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
@@ -826,6 +831,7 @@ struct L402CheckParams {
 #[axum::debug_handler]
 async fn l402_check_handler(
     Extension(state): Extension<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Query(params): Query<L402CheckParams>,
 ) -> Result<Json<Value>, AppError> {
@@ -834,7 +840,7 @@ async fn l402_check_handler(
     }
 
     // Each check hits LND lookup_invoice; rate-limit per IP.
-    let key = format!("l402check:{}", client_ip(&headers));
+    let key = format!("l402check:{}", client_ip(&headers, peer));
     if !state
         .payments
         .try_reserve(&[(&key, L402_CHECK_DAILY_LIMIT)], 1)
@@ -894,12 +900,13 @@ async fn l402_check_handler(
 #[axum::debug_handler]
 async fn bolt11_handler(
     Extension(state): Extension<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<Bolt11Request>,
 ) -> Result<Json<Bolt11Response>, AppError> {
     // Unauthenticated invoice creation is rate-limited per IP to protect
     // the LND node from invoice spam.
-    let key = format!("bolt11:{}", client_ip(&headers));
+    let key = format!("bolt11:{}", client_ip(&headers, peer));
     if !state
         .payments
         .try_reserve(&[(&key, INVOICE_REQ_DAILY_LIMIT)], 1)
@@ -917,13 +924,13 @@ async fn bolt11_handler(
 async fn channel_handler(
     Extension(state): Extension<AppState>,
     Extension(user): Extension<AuthUser>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<ChannelRequest>,
 ) -> Result<Json<ChannelResponse>, AppError> {
-    // Extract the X-Forwarded-For header
-    let x_forwarded_for = client_ip(&headers);
+    let x_forwarded_for = client_ip(&headers, peer);
 
-    let txid = open_channel(&state, x_forwarded_for, Some(&user), payload).await?;
+    let txid = open_channel(&state, &x_forwarded_for, Some(&user), payload).await?;
 
     Ok(Json(ChannelResponse { txid }))
 }
@@ -949,11 +956,15 @@ struct LimitsResponse {
 async fn limits_handler(
     Extension(state): Extension<AppState>,
     Extension(user): Extension<AuthUser>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<LimitsResponse>, AppError> {
-    let x_forwarded_for = client_ip(&headers);
+    let x_forwarded_for = client_ip(&headers, peer);
 
-    let (ip_used, user_used) = state.payments.get_usage(x_forwarded_for, Some(&user)).await;
+    let (ip_used, user_used) = state
+        .payments
+        .get_usage(&x_forwarded_for, Some(&user))
+        .await;
 
     let remaining = if user.is_premium {
         MAX_SEND_AMOUNT
@@ -976,12 +987,13 @@ async fn limits_handler(
 async fn arkade_handler(
     Extension(state): Extension<AppState>,
     Extension(user): Extension<AuthUser>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<ArkadeRequest>,
 ) -> Result<Json<ArkadeResponse>, AppError> {
-    let x_forwarded_for = client_ip(&headers);
+    let x_forwarded_for = client_ip(&headers, peer);
 
-    let res = dispense_arkade(&state, x_forwarded_for, &user, payload).await?;
+    let res = dispense_arkade(&state, &x_forwarded_for, &user, payload).await?;
     Ok(Json(res))
 }
 
@@ -995,20 +1007,28 @@ async fn reorg_invoice_handler(
     Ok(Json(response))
 }
 
-/// Extract the client IP used for rate limiting.
+/// Extract the client identity used for rate limiting.
 ///
-/// nginx sets `X-Forwarded-For: $proxy_add_x_forwarded_for`, which appends
-/// the real client IP as the rightmost entry. Any earlier entries are
-/// client-supplied and must not be trusted, so only the rightmost entry is
-/// used as the rate-limit identity.
-fn client_ip(headers: &HeaderMap) -> &str {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|x| HeaderValue::to_str(x).ok())
-        .and_then(|x| x.rsplit(',').next())
-        .map(str::trim)
-        .filter(|x| !x.is_empty())
-        .unwrap_or("Unknown")
+/// The TCP peer address is the identity by default. `X-Forwarded-For` is
+/// only honored when the direct peer is loopback, i.e. the request came
+/// through the local nginx proxy, which sets
+/// `X-Forwarded-For: $proxy_add_x_forwarded_for` with the real client IP as
+/// the rightmost entry. Any earlier entries are client-supplied and must not
+/// be trusted, so only the rightmost entry is used. Direct connections from
+/// any other peer ignore the header entirely.
+fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
+    if peer.ip().is_loopback() {
+        if let Some(xff) = headers
+            .get("x-forwarded-for")
+            .and_then(|x| HeaderValue::to_str(x).ok())
+            .and_then(|x| x.rsplit(',').next())
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+        {
+            return xff.to_string();
+        }
+    }
+    peer.ip().to_string()
 }
 
 // Make our own error that wraps `anyhow::Error`.
@@ -1119,5 +1139,67 @@ mod tests {
             cookie_value(&headers, OAUTH_STATE_COOKIE).unwrap(),
             "attacker"
         ));
+    }
+
+    /// A request that arrives through the local nginx proxy (loopback peer)
+    /// uses the rightmost X-Forwarded-For entry as its identity.
+    #[test]
+    fn xff_from_loopback_peer_is_used_as_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("1.2.3.4, 203.0.113.66"),
+        );
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+        assert_eq!(client_ip(&headers, peer), "203.0.113.66");
+    }
+
+    /// A spoofed X-Forwarded-For header from a direct (non-loopback) peer
+    /// must not become the rate-limit identity: the TCP peer address wins.
+    #[test]
+    fn spoofed_xff_from_direct_peer_is_ignored() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.66"));
+        let peer = SocketAddr::from(([198, 51, 100, 7], 12345));
+        assert_eq!(client_ip(&headers, peer), "198.51.100.7");
+    }
+
+    /// Without XFF, a loopback peer falls back to its own address.
+    #[test]
+    fn loopback_peer_without_xff_uses_peer_address() {
+        let headers = HeaderMap::new();
+        let peer = SocketAddr::from(([127, 0, 0, 1], 12345));
+        assert_eq!(client_ip(&headers, peer), "127.0.0.1");
+    }
+
+    /// Rotating spoofed XFF values from a direct peer all collapse to the
+    /// same identity, so the per-identity payout budget still applies.
+    #[tokio::test]
+    async fn rotating_spoofed_ips_no_longer_grant_unbounded_withdrawals() {
+        let payments = PaymentsByIp::new();
+        let peer = SocketAddr::from(([198, 51, 100, 7], 12345));
+
+        let identities: Vec<String> = (0..10u32)
+            .map(|i| {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "x-forwarded-for",
+                    HeaderValue::from_str(&format!("203.0.113.{i}")).unwrap(),
+                );
+                client_ip(&headers, peer)
+            })
+            .collect();
+        assert!(identities.iter().all(|id| id == "198.51.100.7"));
+
+        assert!(
+            payments
+                .try_reserve(&[("198.51.100.7", MAX_SEND_AMOUNT)], MAX_SEND_AMOUNT)
+                .await
+        );
+        assert!(
+            !payments
+                .try_reserve(&[("198.51.100.7", MAX_SEND_AMOUNT)], 1)
+                .await
+        );
     }
 }
