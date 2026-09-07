@@ -375,9 +375,10 @@ const OAUTH_STATE_COOKIE: &str = "mutinynet_oauth_state";
 
 fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|cookies| {
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|cookies| {
             cookies.split(';').find_map(|cookie| {
                 let (cookie_name, value) = cookie.trim().split_once('=')?;
                 (cookie_name == name).then_some(value)
@@ -390,6 +391,59 @@ fn oauth_state_cookie(value: &str, secure: bool, max_age: u64) -> String {
     format!(
         "{OAUTH_STATE_COOKIE}={value}; Path=/auth/github/callback; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure}"
     )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GithubCallbackError {
+    MissingState,
+    MissingCookie,
+    StateMismatch,
+    Banned,
+    Internal,
+}
+
+impl IntoResponse for GithubCallbackError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            Self::MissingState => (
+                StatusCode::BAD_REQUEST,
+                "GitHub sign-in state is missing. Return to the faucet and sign in again.",
+            ),
+            Self::MissingCookie => (
+                StatusCode::BAD_REQUEST,
+                "GitHub sign-in cookie is missing or expired. Allow cookies for the faucet, then return to the faucet and sign in again.",
+            ),
+            Self::StateMismatch => (
+                StatusCode::BAD_REQUEST,
+                "GitHub sign-in state does not match. Return to the faucet and sign in again in one browser tab.",
+            ),
+            Self::Banned => (
+                StatusCode::FORBIDDEN,
+                "This GitHub account or email domain is not allowed to use the faucet.",
+            ),
+            Self::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "GitHub sign-in could not be completed. Return to the faucet and try again.",
+            ),
+        };
+        (status, message).into_response()
+    }
+}
+
+fn validate_oauth_state(
+    state: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<(), GithubCallbackError> {
+    let state = state
+        .filter(|state| !state.is_empty())
+        .ok_or(GithubCallbackError::MissingState)?;
+    let cookie = cookie_value(headers, OAUTH_STATE_COOKIE)
+        .filter(|cookie| !cookie.is_empty())
+        .ok_or(GithubCallbackError::MissingCookie)?;
+    if !ct_eq(state, cookie) {
+        return Err(GithubCallbackError::StateMismatch);
+    }
+    Ok(())
 }
 
 #[axum::debug_handler]
@@ -512,18 +566,13 @@ async fn github_callback(
     Query(params): Query<GithubCallback>,
     Extension(state): Extension<AppState>,
     headers: HeaderMap,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, GithubCallbackError> {
     // Validate the OAuth state parameter against the 10-minute HttpOnly cookie.
-    let state_valid = match (
-        params.state.as_deref(),
-        cookie_value(&headers, OAUTH_STATE_COOKIE),
-    ) {
-        (Some(s), Some(cookie_state)) => ct_eq(s, cookie_state),
-        _ => false,
-    };
-    if !state_valid {
-        return Err(StatusCode::BAD_REQUEST);
-    }
+    validate_oauth_state(params.state.as_deref(), &headers).map_err(|error| {
+        // Log the reason only: codes, state values, and cookies are credentials.
+        warn!("GitHub OAuth callback rejected: {error:?}");
+        error
+    })?;
 
     // Exchange code for access token
     let token_response = state
@@ -538,10 +587,10 @@ async fn github_callback(
         }))
         .send()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| GithubCallbackError::Internal)?
         .json::<auth::GithubTokenResponse>()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| GithubCallbackError::Internal)?;
 
     // Get user info
     // Get user's email
@@ -557,21 +606,21 @@ async fn github_callback(
         .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| GithubCallbackError::Internal)?
         .json::<Vec<GithubEmail>>()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| GithubCallbackError::Internal)?;
 
     // Find primary email
     let primary_email: GithubEmail = user_emails
         .into_iter()
         .find(|email| email.primary && email.verified)
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        .ok_or(GithubCallbackError::Internal)?;
 
     // Check if user is banned
     if state.users_cache.is_banned(&primary_email.email).await {
         warn!("User {} is banned!", primary_email.email);
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(GithubCallbackError::Banned);
     }
 
     info!("Authing user through GitHub web flow");
@@ -588,7 +637,7 @@ async fn github_callback(
         &claims,
         &EncodingKey::from_secret(state.auth.jwt_secret.as_bytes()),
     )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|_| GithubCallbackError::Internal)?;
 
     // Redirect to frontend with token
     let mut response =
@@ -600,7 +649,7 @@ async fn github_callback(
             state.host.starts_with("https://"),
             0,
         ))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        .map_err(|_| GithubCallbackError::Internal)?,
     );
     Ok(response)
 }
@@ -1192,6 +1241,96 @@ mod tests {
             cookie_value(&headers, OAUTH_STATE_COOKIE).unwrap(),
             "attacker"
         ));
+    }
+
+    #[test]
+    fn oauth_state_cookie_can_be_in_a_later_header() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("other=x"),
+        );
+        headers.append(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("mutinynet_oauth_state=expected"),
+        );
+
+        assert_eq!(cookie_value(&headers, OAUTH_STATE_COOKIE), Some("expected"));
+    }
+
+    #[test]
+    fn oauth_state_validation_rejects_missing_empty_and_mismatched_values() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            validate_oauth_state(None, &headers),
+            Err(GithubCallbackError::MissingState)
+        );
+        assert_eq!(
+            validate_oauth_state(Some("expected"), &headers),
+            Err(GithubCallbackError::MissingCookie)
+        );
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("mutinynet_oauth_state="),
+        );
+        assert_eq!(
+            validate_oauth_state(Some(""), &headers),
+            Err(GithubCallbackError::MissingState)
+        );
+        assert_eq!(
+            validate_oauth_state(Some("expected"), &headers),
+            Err(GithubCallbackError::MissingCookie)
+        );
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("mutinynet_oauth_state=expected"),
+        );
+        assert_eq!(
+            validate_oauth_state(Some("attacker"), &headers),
+            Err(GithubCallbackError::StateMismatch)
+        );
+        assert_eq!(validate_oauth_state(Some("expected"), &headers), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_errors_explain_the_failure() {
+        use axum::body::HttpBody;
+
+        for (error, status, expected_message) in [
+            (
+                GithubCallbackError::MissingState,
+                StatusCode::BAD_REQUEST,
+                "state is missing",
+            ),
+            (
+                GithubCallbackError::MissingCookie,
+                StatusCode::BAD_REQUEST,
+                "cookie is missing or expired",
+            ),
+            (
+                GithubCallbackError::StateMismatch,
+                StatusCode::BAD_REQUEST,
+                "state does not match",
+            ),
+            (
+                GithubCallbackError::Banned,
+                StatusCode::FORBIDDEN,
+                "not allowed",
+            ),
+            (
+                GithubCallbackError::Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not be completed",
+            ),
+        ] {
+            let response = error.into_response();
+            assert_eq!(response.status(), status);
+            let mut body = response.into_body();
+            let bytes = body.data().await.unwrap().unwrap();
+            assert!(std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains(expected_message));
+        }
     }
 
     /// A request that arrives through the local nginx proxy (loopback peer)
