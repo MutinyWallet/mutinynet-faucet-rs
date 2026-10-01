@@ -1,23 +1,48 @@
+use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 
+use bitcoincore_rpc::Auth;
+use log::{info, warn};
 use nostr::key::Keys;
 use tonic_openssl_lnd::lnrpc;
 
-use crate::AppState;
+use crate::analytics::{init_analytics_db, start_write_batcher};
+use crate::auth::{init_users_db, AuthState, UsersCache};
+use crate::l402::L402Config;
+use crate::monitoring::{start_payment_volume_monitor, MonitoringHealth, PaymentAlertConfig};
+use crate::reorg::init_reorg_db;
+use crate::{AppState, ReorgConfig};
 
 pub async fn setup() -> anyhow::Result<AppState> {
     // Load environment variables from various sources.
-    dotenv::from_filename(".env.local").ok();
-    dotenv::from_filename(".env").ok();
-    dotenv::dotenv().ok();
+    dotenvy::from_filename(".env.local").ok();
+    dotenvy::from_filename(".env").ok();
+    dotenvy::dotenv().ok();
     // log env logger after dotenv
     pretty_env_logger::try_init()?;
 
     let host = env::var("HOST").expect("missing HOST");
 
+    // Load environment variables
+    let github_client_id = env::var("GITHUB_CLIENT_ID").expect("GITHUB_CLIENT_ID must be set");
+    let github_client_secret =
+        env::var("GITHUB_CLIENT_SECRET").expect("GITHUB_CLIENT_SECRET must be set");
+    let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+
+    if github_client_id.is_empty() {
+        panic!("GITHUB_CLIENT_ID must be set");
+    }
+    if github_client_secret.is_empty() {
+        panic!("GITHUB_CLIENT_SECRET must be set");
+    }
+    if jwt_secret.is_empty() {
+        panic!("JWT_SECRET must be set");
+    }
+
     // read keys from env, otherwise generate one
     let keys = env::var("NSEC")
-        .map(|k| Keys::parse(k).expect("Invalid nsec"))
+        .map(|k| Keys::parse(&k).expect("Invalid nsec"))
         .unwrap_or(Keys::generate());
 
     let network = env::var("NETWORK").expect("missing NETWORK");
@@ -32,7 +57,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
     println!("network: {:?}", network);
 
     // Setup lightning stuff
-    let lightning_client = {
+    let (lightning_client, router_client) = {
         let address = env::var("GRPC_HOST").expect("missing GRPC_HOST");
         let macaroon_file = env::var("ADMIN_MACAROON_PATH").expect("missing ADMIN_MACAROON_PATH");
         let cert_file = env::var("TLS_CERT_PATH").expect("missing TLS_CERT_PATH");
@@ -46,6 +71,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
             .expect("failed to connect");
 
         let lightning_client = lnd.lightning().clone();
+        let router_client = lnd.router().clone();
 
         // Make sure we can get info at startup
         let _ = lightning_client
@@ -55,8 +81,285 @@ pub async fn setup() -> anyhow::Result<AppState> {
             .expect("failed to get info")
             .into_inner();
 
-        lightning_client
+        (lightning_client, router_client)
     };
 
-    Ok(AppState::new(host, keys, lightning_client, network))
+    let auth = AuthState {
+        client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?,
+        github_client_id,
+        github_client_secret,
+        jwt_secret,
+    };
+
+    // Initialize reorg configuration
+    let reorg_enabled = env::var("REORG_ENABLED")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()?;
+
+    let reorg_cooldown_seconds = env::var("REORG_COOLDOWN_SECONDS")
+        .unwrap_or_else(|_| "3600".to_string())
+        .parse::<u64>()?;
+
+    // Initialize L402 configuration
+    let l402_enabled = env::var("L402_ENABLED")
+        .unwrap_or_else(|_| "false".to_string())
+        .parse::<bool>()?;
+
+    let l402_invoice_amount_sats = env::var("L402_INVOICE_AMOUNT")
+        .unwrap_or_else(|_| "1000".to_string())
+        .parse::<u64>()?;
+
+    // Initialize mainnet LND client if reorg or L402 is enabled
+    let needs_mainnet_lnd = reorg_enabled || l402_enabled;
+    let mainnet_lightning_client = if needs_mainnet_lnd {
+        let mainnet_address = env::var("MAINNET_GRPC_HOST").ok();
+        let mainnet_macaroon = env::var("MAINNET_ADMIN_MACAROON_PATH").ok();
+        let mainnet_cert = env::var("MAINNET_TLS_CERT_PATH").ok();
+        let mainnet_port_str = env::var("MAINNET_GRPC_PORT").ok();
+
+        match (
+            mainnet_address,
+            mainnet_macaroon,
+            mainnet_cert,
+            mainnet_port_str,
+        ) {
+            (Some(address), Some(macaroon_file), Some(cert_file), Some(port_str)) => {
+                let port: u32 = port_str
+                    .parse()
+                    .expect("MAINNET_GRPC_PORT must be a number");
+
+                info!("Connecting to mainnet LND at {}:{}", address, port);
+
+                let mut mainnet_lnd =
+                    tonic_openssl_lnd::connect(address.clone(), port, cert_file, macaroon_file)
+                        .await
+                        .expect("Failed to connect to mainnet LND");
+
+                let mainnet_client = mainnet_lnd.lightning().clone();
+
+                // Verify connection and check it's mainnet
+                let info = mainnet_client
+                    .clone()
+                    .get_info(lnrpc::GetInfoRequest {})
+                    .await
+                    .expect("Failed to get mainnet LND info")
+                    .into_inner();
+
+                // Verify this is actually mainnet
+                let is_mainnet = info.chains.iter().any(|chain| chain.network == "mainnet");
+
+                if !is_mainnet {
+                    panic!(
+                        "Mainnet LND connection is not on mainnet! Found chains: {:?}",
+                        info.chains
+                    );
+                }
+
+                info!("Successfully connected to mainnet LND");
+                Some(mainnet_client)
+            }
+            _ => {
+                warn!("Mainnet LND env vars not set. Features requiring mainnet LND will be disabled.");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Initialize Bitcoin Core RPC client if reorg is enabled
+    let bitcoin_rpc = if reorg_enabled && mainnet_lightning_client.is_some() {
+        let rpc_url = env::var("BITCOIN_RPC_HOST_AND_PORT").ok();
+        let rpc_user = env::var("BITCOIN_RPC_USER").ok();
+        let rpc_password = env::var("BITCOIN_RPC_PASSWORD").ok();
+
+        match (rpc_url, rpc_user, rpc_password) {
+            (Some(url), Some(user), Some(password)) => {
+                info!("Connecting to Bitcoin Core RPC at {}", url);
+
+                let full_url = if url.starts_with("http") {
+                    url
+                } else {
+                    format!("http://{url}")
+                };
+
+                let rpc_client =
+                    bitcoincore_rpc::Client::new(&full_url, Auth::UserPass(user, password))
+                        .expect("Failed to create Bitcoin Core RPC client");
+
+                info!("Successfully connected to Bitcoin Core",);
+                Some(Arc::new(rpc_client))
+            }
+            _ => {
+                warn!("REORG_ENABLED=true but Bitcoin Core RPC env vars not set. Reorg feature will be disabled.");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Initialize reorg database if feature enabled
+    let reorg_db = if reorg_enabled && mainnet_lightning_client.is_some() && bitcoin_rpc.is_some() {
+        let db_path = env::var("REORG_DB_PATH").unwrap_or_else(|_| "reorg.db".to_string());
+        match init_reorg_db(&db_path).await {
+            Ok(pool) => {
+                info!("Reorg database initialized");
+                Some(pool)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to initialize reorg database: {}. Reorg feature will be disabled.",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Final check: only enable if mainnet LND, Bitcoin RPC, and DB are all available
+    let reorg_final_enabled = reorg_enabled
+        && mainnet_lightning_client.is_some()
+        && bitcoin_rpc.is_some()
+        && reorg_db.is_some();
+
+    if reorg_enabled && !reorg_final_enabled {
+        warn!("Reorg feature requested but not fully configured. Feature disabled.");
+    } else if reorg_final_enabled {
+        info!(
+            "Reorg feature enabled with {} second cooldown",
+            reorg_cooldown_seconds
+        );
+    }
+
+    // Initialize pricing map
+    let mut pricing = HashMap::with_capacity(6);
+    pricing.insert(1, 10_000);
+    pricing.insert(2, 20_000);
+    pricing.insert(3, 35_000);
+    pricing.insert(4, 50_000);
+    pricing.insert(5, 75_000);
+
+    let reorg_config = ReorgConfig {
+        enabled: reorg_final_enabled,
+        cooldown_seconds: reorg_cooldown_seconds,
+        pricing,
+    };
+
+    // Finalize L402 config
+    let l402_final_enabled = l402_enabled && mainnet_lightning_client.is_some();
+
+    if l402_enabled && !l402_final_enabled {
+        warn!("L402 feature requested but mainnet LND not configured. L402 disabled.");
+    } else if l402_final_enabled {
+        info!(
+            "L402 authentication enabled with {} sat invoice amount",
+            l402_invoice_amount_sats
+        );
+    }
+
+    let l402_config = L402Config {
+        enabled: l402_final_enabled,
+        invoice_amount_sats: l402_invoice_amount_sats,
+    };
+
+    // Initialize users database (banned/premium/whitelisted users and domains)
+    let users_db_path = env::var("USERS_DB_PATH").unwrap_or_else(|_| "users.db".to_string());
+    let users_db = init_users_db(&users_db_path).await?;
+    let users_cache = UsersCache::load(&users_db).await?;
+    info!("Users database initialized at {}", users_db_path);
+
+    let payment_alert_config = PaymentAlertConfig::from_env()?;
+    let monitoring_health = MonitoringHealth::new(payment_alert_config.is_some());
+
+    // Initialize analytics database
+    let analytics_db_path =
+        env::var("ANALYTICS_DB_PATH").unwrap_or_else(|_| "analytics.db".to_string());
+    let (analytics_db, analytics_writer) = match init_analytics_db(&analytics_db_path).await {
+        Ok(pool) => {
+            info!("Analytics database initialized at {}", analytics_db_path);
+            let writer = start_write_batcher(pool.clone(), monitoring_health.clone());
+            (Some(pool), Some(writer))
+        }
+        Err(e) => {
+            warn!(
+                "Failed to initialize analytics database: {}. Analytics disabled.",
+                e
+            );
+            (None, None)
+        }
+    };
+
+    match (&analytics_db, payment_alert_config) {
+        (Some(pool), Some(config)) => {
+            start_payment_volume_monitor(pool.clone(), config, monitoring_health.clone())
+        }
+        (None, Some(_)) => anyhow::bail!("Payment alerts require the analytics database"),
+        (_, None) => info!("Payment alerts are disabled"),
+    }
+
+    let admin_token = env::var("ADMIN_TOKEN").ok();
+    match &admin_token {
+        Some(token) if token.len() < 32 => {
+            warn!("ADMIN_TOKEN is short; use at least 32 random characters")
+        }
+        Some(_) => info!("Admin API token configured"),
+        None => warn!("ADMIN_TOKEN not set — admin endpoints will return 404"),
+    }
+
+    let analytics_token = env::var("ANALYTICS_TOKEN").ok();
+    match &analytics_token {
+        Some(token) if token.len() < 32 => {
+            warn!("ANALYTICS_TOKEN is short; use at least 32 random characters")
+        }
+        Some(_) => info!("Analytics API token configured"),
+        None if analytics_db.is_some() => {
+            warn!("ANALYTICS_TOKEN not set — analytics endpoints will return 404")
+        }
+        None => {}
+    }
+
+    let arkade_daemon_url = env::var("ARKADE_DAEMON_URL").ok();
+    let arkade_internal_token = env::var("ARKADE_INTERNAL_TOKEN").ok();
+    match arkade_daemon_url.as_deref() {
+        Some(url) => info!("Arkade daemon configured at {}", url),
+        None => warn!("ARKADE_DAEMON_URL not set — /api/arkade will return an error"),
+    }
+
+    // Trust X-Forwarded-For from the local nginx proxy only. nginx arrives
+    // via docker-proxy with the container's default gateway as its peer;
+    // when no gateway can be detected (local dev), trust loopback only.
+    let trusted_gateway = crate::default_gateway();
+    match &trusted_gateway {
+        Some(ip) => info!("Trusting X-Forwarded-For from loopback and gateway {ip}"),
+        None => info!("No default gateway found; trusting X-Forwarded-For from loopback only"),
+    }
+
+    Ok(AppState::new(
+        host,
+        keys,
+        lightning_client,
+        router_client,
+        mainnet_lightning_client,
+        bitcoin_rpc,
+        reorg_db,
+        network,
+        auth,
+        reorg_config,
+        l402_config,
+        users_db,
+        users_cache,
+        admin_token,
+        analytics_db,
+        analytics_writer,
+        analytics_token,
+        monitoring_health,
+        arkade_daemon_url,
+        arkade_internal_token,
+        trusted_gateway,
+    ))
 }

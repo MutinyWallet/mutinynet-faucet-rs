@@ -1,0 +1,415 @@
+# Analytics API
+
+The faucet records every payment to a local SQLite database and exposes read-only endpoints for building dashboards. All endpoints return JSON.
+
+## Configuration
+
+| Environment Variable | Default | Description |
+|---|---|---|
+| `ANALYTICS_DB_PATH` | `analytics.db` | Path to the SQLite database file |
+| `ANALYTICS_TOKEN` | _(none)_ | API token for analytics endpoints. **Required** — endpoints return 404 if unset. |
+
+The database is created automatically on startup. No migration steps are needed.
+
+## Telegram payment alerts
+
+The faucet can send an alert when outgoing payment volume reaches a limit. The alert uses the same analytics database.
+
+Set these environment variables:
+
+| Environment Variable | Default | Description |
+|---|---:|---|
+| `PAYMENT_ALERT_THRESHOLD_SATS` | _(none)_ | Volume limit in sats. This value enables the alert. |
+| `TELEGRAM_BOT_TOKEN` | _(none)_ | Token from BotFather. This value is required when the alert is enabled. |
+| `TELEGRAM_CHAT_ID` | _(none)_ | Telegram chat ID that receives the alert. |
+| `PAYMENT_ALERT_WINDOW_SECONDS` | `3600` | Length of the rolling volume window. |
+| `PAYMENT_ALERT_CHECK_INTERVAL_SECONDS` | `60` | Time between volume checks. |
+| `PAYMENT_ALERT_COOLDOWN_SECONDS` | `3600` | Minimum time between repeated alerts while volume stays high. |
+
+The volume includes successful outgoing payments and channel opens. Generated `bolt11` invoices do not count as outgoing payments.
+
+The faucet sends an alert when the volume first reaches the limit. It sends another alert after the cooldown if the volume stays high.
+
+The faucet sends a startup message to make sure that the bot can write to the configured chat. It checks Telegram during each interval.
+
+If a database write fails, the analytics writer keeps the payment records and retries. Telegram reports a persistent failure and its recovery.
+
+If payment alerts are enabled, the faucet does not start without the analytics database.
+
+To configure Telegram:
+
+1. Create a bot with BotFather and copy its token.
+2. Send a message to the new bot.
+3. Get the chat ID from `https://api.telegram.org/bot<token>/getUpdates`.
+4. Set the variables and restart the faucet.
+
+### Monitoring health
+
+`GET /api/analytics/monitoring/health` reports the state of the analytics writer and Telegram. This endpoint requires the analytics Bearer token.
+
+The endpoint returns `503 Service Unavailable` when a configured monitoring component is degraded.
+
+```json
+{
+  "status": "healthy",
+  "alerts_configured": true,
+  "analytics_writer": "healthy",
+  "telegram": "healthy"
+}
+```
+
+## Authentication
+
+All analytics endpoints require a Bearer token matching the `ANALYTICS_TOKEN` environment variable:
+
+```
+Authorization: Bearer <your-analytics-token>
+```
+
+Returns `401 Unauthorized` if the token is missing or wrong. Returns `404 Not Found` if `ANALYTICS_TOKEN` is not configured (endpoints are hidden).
+
+## Payment Types
+
+Every recorded payment has a `payment_type` field. Possible values:
+
+| Type | Source | Description |
+|---|---|---|
+| `onchain` | `POST /api/onchain` | On-chain bitcoin send |
+| `lightning` | `POST /api/lightning`, `GET /api/lnurlw/callback` | Lightning invoice payment (includes LNURL-pay, lightning addresses, and zaps) |
+| `channel` | `POST /api/channel` | Lightning channel open |
+| `bolt11` | `POST /api/bolt11` | Invoice generation (receive-side testing) |
+| `nostr_dm` | Nostr DM listener | Lightning payment triggered via Nostr DM |
+| `nostr_dm_onchain` | Nostr DM listener | On-chain payment triggered via Nostr DM |
+
+## Common Query Parameters
+
+All endpoints (except `/recent`) accept:
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `hours` | integer | `24` | Rolling window to look back |
+| `payment_type` | string | _(all)_ | Filter to a single payment type |
+
+## Endpoints
+
+### `GET /api/analytics` (combined)
+
+Returns all analytics data in a single request. Use this for initial dashboard load to avoid multiple round trips. All queries and LND balance calls run concurrently.
+
+**Params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `hours` | integer | `24` | Rolling window to look back |
+| `interval` | string | `hour` | Bucket size for timeseries: `hour` or `day` |
+| `recent_limit` | integer | `50` | Max recent payments |
+| `users_limit` | integer | `50` | Max top users |
+| `domains_limit` | integer | `50` | Max domains |
+
+**Response:** contains all sections: `summary`, `timeseries`, `recent`, `users`, `domains`, `l402`, and `balance`.
+
+```json
+{
+  "hours": 24,
+  "interval": "hour",
+  "summary": { "total_count": 142, "total_sats": 84200000, "unique_users": 37, "avg_sats": 593000, "by_type": [...] },
+  "timeseries": [{ "time": "...", "count": 5, "total_sats": 2500000, "by_type": [...] }, ...],
+  "recent": [{ "id": 1042, "created_at": 1710700123, "payment_type": "onchain", "amount_sats": 500000, "user": "...", "destination": "..." }, ...],
+  "users": [{ "user": "alice@example.com", "count": 12, "total_sats": 8400000, "last_payment": 1710700000 }, ...],
+  "domains": [{ "domain": "gmail.com", "count": 80, "total_sats": 50000000, "unique_users": 25 }, ...],
+  "l402": {
+    "issued": { "count": 45, "total_sats": 45000, "timeseries": [...] },
+    "paid": { "count": 30, "total_sats": 30000, "timeseries": [...] }
+  },
+  "balance": {
+    "onchain": { "total_sats": 50000000, "confirmed_sats": 49500000, "unconfirmed_sats": 500000 },
+    "lightning": { "local_balance_sats": 30000000, "remote_balance_sats": 15000000, "pending_open_local_sats": 0, "pending_open_remote_sats": 0 }
+  }
+}
+```
+
+---
+
+The individual endpoints below are still available for targeted queries:
+
+### `GET /api/analytics/summary`
+
+High-level KPIs for the time window. Use for dashboard header cards.
+
+**Extra params:** none
+
+**Response:**
+
+```json
+{
+  "hours": 24,
+  "total_count": 142,
+  "total_sats": 84200000,
+  "unique_users": 37,
+  "avg_sats": 593000,
+  "by_type": [
+    { "payment_type": "onchain", "count": 80, "total_sats": 60000000 },
+    { "payment_type": "lightning", "count": 50, "total_sats": 20000000 },
+    { "payment_type": "channel", "count": 12, "total_sats": 4200000 }
+  ]
+}
+```
+
+---
+
+### `GET /api/analytics/timeseries`
+
+Bucketed time series with per-type breakdown in each bucket. Use for stacked area/bar charts.
+
+**Extra params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `interval` | string | `hour` | Bucket size: `hour` or `day` |
+
+**Response:**
+
+```json
+{
+  "hours": 48,
+  "interval": "hour",
+  "buckets": [
+    {
+      "time": "2026-03-16T14:00:00Z",
+      "count": 5,
+      "total_sats": 2500000,
+      "by_type": [
+        { "payment_type": "onchain", "count": 3, "total_sats": 2000000 },
+        { "payment_type": "lightning", "count": 2, "total_sats": 500000 }
+      ]
+    },
+    {
+      "time": "2026-03-16T15:00:00Z",
+      "count": 8,
+      "total_sats": 4100000,
+      "by_type": [
+        { "payment_type": "onchain", "count": 4, "total_sats": 3000000 },
+        { "payment_type": "lightning", "count": 3, "total_sats": 900000 },
+        { "payment_type": "channel", "count": 1, "total_sats": 200000 }
+      ]
+    }
+  ]
+}
+```
+
+---
+
+### `GET /api/analytics/users`
+
+Top users ranked by total sats, with per-type breakdown for each user.
+
+**Extra params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | integer | `50` | Max number of users to return |
+
+**Response:**
+
+```json
+{
+  "hours": 24,
+  "users": [
+    {
+      "user": "alice@example.com",
+      "count": 12,
+      "total_sats": 8400000,
+      "last_payment": 1710700000,
+      "by_type": [
+        { "payment_type": "onchain", "count": 8, "total_sats": 6000000 },
+        { "payment_type": "lightning", "count": 4, "total_sats": 2400000 }
+      ]
+    },
+    {
+      "user": "192.168.1.50",
+      "count": 3,
+      "total_sats": 1500000,
+      "last_payment": 1710695000,
+      "by_type": [
+        { "payment_type": "lightning", "count": 3, "total_sats": 1500000 }
+      ]
+    }
+  ]
+}
+```
+
+The `user` field is the GitHub email when authenticated, or the IP address for unauthenticated requests (LNURL-withdraw, Nostr DMs). `last_payment` is a Unix timestamp.
+
+---
+
+### `GET /api/analytics/recent`
+
+Most recent individual payments. Use for a live activity feed.
+
+**Params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | integer | `50` | Max number of payments to return |
+| `payment_type` | string | _(all)_ | Filter to a single payment type |
+
+Note: this endpoint does **not** accept `hours` — it always returns the N most recent payments regardless of age.
+
+**Response:**
+
+```json
+{
+  "payments": [
+    {
+      "id": 1042,
+      "created_at": 1710700123,
+      "payment_type": "onchain",
+      "amount_sats": 500000,
+      "user": "alice@example.com",
+      "destination": "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"
+    },
+    {
+      "id": 1041,
+      "created_at": 1710700100,
+      "payment_type": "lightning",
+      "amount_sats": 100000,
+      "user": "192.168.1.50",
+      "destination": "lnbc1u1pj..."
+    }
+  ]
+}
+```
+
+### `GET /api/analytics/domains`
+
+Usage breakdown by email domain (gmail.com, hotmail.com, proton.me, etc.). Only includes authenticated users with email usernames — excludes L402 users, IPs, and Nostr pubkeys.
+
+**Extra params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | integer | `50` | Max number of domains to return |
+
+**Response:**
+
+```json
+{
+  "hours": 24,
+  "total_count": 120,
+  "total_sats": 72000000,
+  "domains": [
+    { "domain": "gmail.com", "count": 80, "total_sats": 50000000, "unique_users": 25 },
+    { "domain": "proton.me", "count": 20, "total_sats": 12000000, "unique_users": 8 },
+    { "domain": "hotmail.com", "count": 12, "total_sats": 6000000, "unique_users": 3 },
+    { "domain": "example.com", "count": 8, "total_sats": 4000000, "unique_users": 1 }
+  ]
+}
+```
+
+---
+
+### `GET /api/analytics/l402`
+
+L402 authentication stats. Shows tokens issued (mainnet invoices generated) and payments made by L402-authenticated users, each with their own timeseries.
+
+**Extra params:**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `interval` | string | `hour` | Bucket size: `hour` or `day` |
+
+Note: this endpoint does **not** accept `payment_type` — it's L402-specific.
+
+**Response:**
+
+```json
+{
+  "hours": 24,
+  "interval": "hour",
+  "issued": {
+    "count": 45,
+    "total_sats": 45000,
+    "timeseries": [
+      { "time": "2026-03-16T14:00:00Z", "count": 3, "total_sats": 3000 },
+      { "time": "2026-03-16T15:00:00Z", "count": 5, "total_sats": 5000 }
+    ]
+  },
+  "paid": {
+    "count": 30,
+    "total_sats": 30000,
+    "timeseries": [
+      { "time": "2026-03-16T14:00:00Z", "count": 2, "total_sats": 2000 },
+      { "time": "2026-03-16T15:00:00Z", "count": 4, "total_sats": 4000 }
+    ]
+  },
+  "usage": {
+    "count": 12,
+    "total_sats": 6000000,
+    "unique_tokens": 8,
+    "timeseries": [
+      { "time": "2026-03-16T14:00:00Z", "count": 1, "total_sats": 500000 },
+      { "time": "2026-03-16T15:00:00Z", "count": 3, "total_sats": 1500000 }
+    ]
+  }
+}
+```
+
+L402 data is stored in a separate `l402_invoices` table (not mixed with faucet payments).
+
+- `issued` — L402 invoices created. One row per token.
+- `paid` — subset that were actually paid. `paid` timeseries uses `paid_at` timestamps. Compare `issued` vs `paid` for conversion rate. `total_sats` is revenue collected.
+- `usage` — faucet payments made by users who authenticated via L402 (from `faucet_payments`). `unique_tokens` is distinct L402 tokens used.
+
+---
+
+### `GET /api/analytics/balance`
+
+Live wallet balances from LND. No query parameters — returns current state.
+
+**Response:**
+
+```json
+{
+  "onchain": {
+    "total_sats": 50000000,
+    "confirmed_sats": 49500000,
+    "unconfirmed_sats": 500000
+  },
+  "lightning": {
+    "local_balance_sats": 30000000,
+    "remote_balance_sats": 15000000,
+    "pending_open_local_sats": 0,
+    "pending_open_remote_sats": 0
+  }
+}
+```
+
+- `onchain.total_sats` — total on-chain wallet balance (confirmed + unconfirmed)
+- `lightning.local_balance_sats` — outbound liquidity (what the faucet can send)
+- `lightning.remote_balance_sats` — inbound liquidity
+
+---
+
+## Database Schema
+
+```sql
+-- Faucet payment events (dispensing stats)
+CREATE TABLE faucet_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    payment_type TEXT NOT NULL,
+    amount_sats INTEGER NOT NULL,
+    username TEXT,
+    ip_address TEXT NOT NULL,
+    destination TEXT
+);
+
+-- L402 invoice lifecycle (revenue tracking, separate from faucet dispensing)
+CREATE TABLE l402_invoices (
+    payment_hash TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    amount_sats INTEGER NOT NULL,
+    paid INTEGER NOT NULL DEFAULT 0,
+    paid_at INTEGER
+);
+```
