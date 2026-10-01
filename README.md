@@ -3,6 +3,9 @@
 1. Copy `.env.sample` to `.env.local` and fill it out with bitcoind and lnd connection info
 2. Run `cargo build && cargo start`
 
+When upgrading the connected daemon from LND 0.20 to 0.21, follow the
+[LND 0.21 upgrade checklist](docs/lnd-0.21-upgrade.md).
+
 ## Endpoint examples
 
 ```sh
