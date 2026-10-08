@@ -339,66 +339,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn success_keeps_the_reservation() {
-        let payments = PaymentsByIp::new();
-        let paid = send_reserved(
-            &payments,
-            fake_daemon(StatusCode::OK, 50_000),
-            IP,
-            &alice(),
-            50_000,
-        )
-        .await
-        .unwrap();
-        assert_eq!(paid["txid"], "t1");
-        assert_eq!(usage(&payments).await, (50_000, 50_000));
-    }
-
-    #[tokio::test]
-    async fn a_cheaper_invoice_counts_what_was_paid() {
-        let payments = PaymentsByIp::new();
-        send_reserved(
-            &payments,
-            fake_daemon(StatusCode::OK, 21_000),
-            IP,
-            &alice(),
-            50_000,
-        )
-        .await
-        .unwrap();
-        assert_eq!(usage(&payments).await, (21_000, 21_000));
-    }
-
-    #[tokio::test]
-    async fn rejected_send_releases_the_reservation() {
-        let payments = PaymentsByIp::new();
-        let err = send_reserved(
-            &payments,
-            fake_daemon(StatusCode::CONFLICT, 0),
-            IP,
-            &alice(),
-            50_000,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status, StatusCode::CONFLICT);
-        assert_eq!(usage(&payments).await, (0, 0));
-    }
-
-    #[tokio::test]
-    async fn ambiguous_failure_keeps_the_reservation() {
-        let payments = PaymentsByIp::new();
-        let err = send_reserved(
-            &payments,
-            fake_daemon(StatusCode::INTERNAL_SERVER_ERROR, 0),
-            IP,
-            &alice(),
-            50_000,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(usage(&payments).await, (50_000, 50_000));
+    async fn the_daemon_answer_settles_a_50k_reservation() {
+        // (daemon status, sats it reports paid, sats left reserved)
+        for (status, paid, reserved) in [
+            (StatusCode::OK, 50_000, 50_000),
+            (StatusCode::OK, 21_000, 21_000),
+            (StatusCode::CONFLICT, 0, 0),
+            (StatusCode::INTERNAL_SERVER_ERROR, 0, 50_000),
+        ] {
+            let payments = PaymentsByIp::new();
+            match send_reserved(&payments, fake_daemon(status, paid), IP, &alice(), 50_000).await {
+                Ok(json) => assert!(status.is_success() && json["txid"] == "t1"),
+                Err(error) => assert_eq!(error.status, status),
+            }
+            assert_eq!(usage(&payments).await, (reserved, reserved), "{status}");
+        }
     }
 
     #[tokio::test]
