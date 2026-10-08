@@ -284,7 +284,10 @@ async fn main() -> anyhow::Result<()> {
                         .parse::<axum::http::HeaderValue>()
                         .expect("HOST must be a valid origin URL"),
                 )
-                .allow_headers([axum::http::header::AUTHORIZATION])
+                .allow_headers([
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::HeaderName::from_static(L402_CLAIM_HEADER),
+                ])
                 .allow_methods(AllowMethods::any()),
         );
 
@@ -792,7 +795,15 @@ async fn lnurlw_callback_handler(
 struct L402HandlerResponse {
     invoice: String,
     token: String,
+    /// Lets the requester fetch the preimage from `/api/l402/check`. Only
+    /// returned to the caller of `POST /api/l402`, never in the public 402
+    /// challenge.
+    claim: String,
 }
+
+/// Header carrying the claim secret to `/api/l402/check`. A header rather
+/// than a query parameter so it stays out of URLs and access logs.
+const L402_CLAIM_HEADER: &str = "x-l402-claim";
 
 async fn generate_l402_challenge(state: &AppState) -> Result<L402HandlerResponse, AppError> {
     if !state.l402_config.enabled {
@@ -820,6 +831,7 @@ async fn generate_l402_challenge(state: &AppState) -> Result<L402HandlerResponse
     }
 
     Ok(L402HandlerResponse {
+        claim: l402::claim_secret(&state.auth.jwt_secret, &response.payment_hash),
         invoice: response.invoice,
         token: response.token,
     })
@@ -940,13 +952,27 @@ async fn l402_check_handler(
         .into_inner();
 
     if invoice.state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Settled as i32 {
-        // Never return the preimage here: the token is public by design
-        // (it travels in URLs and the 402 challenge), so anyone holding it
-        // could steal the payer's preimage. The payer learns the preimage
+        // The token is public by design (it travels in URLs and the 402
+        // challenge), so the preimage is only returned alongside proof that
+        // the caller requested this invoice. Anyone else learns the preimage
         // from their own Lightning payment.
-        Ok(Json(json!({
-            "status": "settled",
-        })))
+        let claimed = headers
+            .get(L402_CLAIM_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|claim| {
+                l402::verify_claim_secret(&state.auth.jwt_secret, payment_hash_hex, claim)
+            });
+
+        if claimed {
+            Ok(Json(json!({
+                "status": "settled",
+                "preimage": hex::encode(&invoice.r_preimage),
+            })))
+        } else {
+            Ok(Json(json!({
+                "status": "settled",
+            })))
+        }
     } else if invoice.state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Canceled as i32 {
         Ok(Json(json!({
             "status": "expired",

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use bitcoin::hashes::hex::FromHex;
-use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hashes::{hmac, sha256, Hash, HashEngine};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -77,6 +77,28 @@ pub fn verify_l402_preimage(preimage_hex: &str, payment_hash_hex: &str) -> bool 
     sha256::Hash::hash(&preimage_bytes) == expected
 }
 
+/// Secret handed only to whoever requested the invoice, letting them claim
+/// the preimage from `/api/l402/check` once it is paid. The token alone is not
+/// enough because it is public (it travels in URLs and the 402 challenge).
+/// Derived from the payment hash so no per-invoice state is stored.
+pub fn claim_secret(jwt_secret: &str, payment_hash_hex: &str) -> String {
+    let mut engine = hmac::HmacEngine::<sha256::Hash>::new(jwt_secret.as_bytes());
+    engine.input(b"l402-claim:");
+    engine.input(payment_hash_hex.as_bytes());
+    hmac::Hmac::<sha256::Hash>::from_engine(engine).to_string()
+}
+
+pub fn verify_claim_secret(jwt_secret: &str, payment_hash_hex: &str, claim: &str) -> bool {
+    let expected = claim_secret(jwt_secret, payment_hash_hex);
+    // constant-time comparison so the secret can't be recovered by timing
+    expected.len() == claim.len()
+        && expected
+            .bytes()
+            .zip(claim.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
 #[derive(Debug, PartialEq)]
 pub enum L402Error {
     InvalidToken,
@@ -134,6 +156,49 @@ mod tests {
             &EncodingKey::from_secret(secret.as_bytes()),
         )
         .unwrap()
+    }
+
+    // -- claim secret tests --
+
+    #[test]
+    fn test_claim_secret_roundtrip() {
+        let payment_hash = test_payment_hash();
+        let claim = claim_secret(TEST_SECRET, &payment_hash);
+        assert!(verify_claim_secret(TEST_SECRET, &payment_hash, &claim));
+    }
+
+    #[test]
+    fn test_claim_secret_wrong_payment_hash() {
+        let claim = claim_secret(TEST_SECRET, &test_payment_hash());
+        let other_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(!verify_claim_secret(TEST_SECRET, other_hash, &claim));
+    }
+
+    #[test]
+    fn test_claim_secret_wrong_secret() {
+        let payment_hash = test_payment_hash();
+        let claim = claim_secret("secret_a", &payment_hash);
+        assert!(!verify_claim_secret("secret_b", &payment_hash, &claim));
+    }
+
+    #[test]
+    fn test_claim_secret_rejects_empty_and_truncated() {
+        let payment_hash = test_payment_hash();
+        let claim = claim_secret(TEST_SECRET, &payment_hash);
+        assert!(!verify_claim_secret(TEST_SECRET, &payment_hash, ""));
+        assert!(!verify_claim_secret(
+            TEST_SECRET,
+            &payment_hash,
+            &claim[..32]
+        ));
+    }
+
+    #[test]
+    fn test_claim_secret_differs_from_payment_hash_and_token() {
+        let payment_hash = test_payment_hash();
+        let claim = claim_secret(TEST_SECRET, &payment_hash);
+        assert_ne!(claim, payment_hash);
+        assert_eq!(claim.len(), 64);
     }
 
     // -- verify_l402_preimage tests --
