@@ -33,7 +33,7 @@ use crate::analytics::{
     analytics_balance, analytics_combined, analytics_domains, analytics_l402, analytics_recent,
     analytics_summary, analytics_timeseries, analytics_users, user_recent, AnalyticsWriter,
 };
-use crate::arkade::{dispense_arkade, ArkadeError, ArkadeRequest, ArkadeResponse};
+use crate::arkade::{dispense_arkade, ArkadeError, ArkadeRequest};
 use crate::auth::{auth_middleware, AuthState, AuthUser, GithubCallback, UsersCache};
 use crate::monitoring::{monitoring_health_handler, MonitoringHealth};
 use crate::nostr_dms::listen_to_nostr_dms;
@@ -1054,7 +1054,7 @@ async fn arkade_handler(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(payload): Json<ArkadeRequest>,
-) -> Result<Json<ArkadeResponse>, ArkadeError> {
+) -> Result<Json<Value>, ArkadeError> {
     let x_forwarded_for = client_ip(&headers, peer, state.trusted_gateway);
 
     let res = dispense_arkade(&state, &x_forwarded_for, &user, payload).await?;
