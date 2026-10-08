@@ -17,8 +17,7 @@ use crate::{AppState, MAX_SEND_AMOUNT};
 
 #[derive(Clone, Deserialize)]
 pub struct ArkadeRequest {
-    #[serde(alias = "address")]
-    pub destination: String,
+    pub address: String,
     pub sats: u64,
 }
 
@@ -73,13 +72,13 @@ pub async fn dispense_arkade(
         return Err(anyhow::anyhow!("max amount is {MAX_SEND_AMOUNT}").into());
     }
 
-    let requested = payload.destination.trim().trim_matches('"');
+    let requested = payload.address.trim().trim_matches('"');
     let destination = resolve_lnurl(requested, payload.sats).await?;
 
     // Keep connection details and server error bodies out of client responses.
     let daemon_url = daemon_url.trim_end_matches('/');
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(anyhow::Error::from)?;
     let mut req = client
@@ -161,11 +160,11 @@ async fn send_reserved(
 
     let result = send_request(req).await;
     match &result {
-        // A destination's own amount can undercut sats; count what was paid.
+        // Count what was paid; adding before releasing never shows a too-low total in between.
         Ok(paid) => {
-            if let Some(amount) = paid["amount"].as_u64().filter(|amount| *amount < sats) {
-                payments.release_payment(ip, None, Some(user), sats).await;
+            if let Some(amount) = paid["amount"].as_u64().filter(|amount| *amount != sats) {
                 payments.add_payment(ip, None, Some(user), amount).await;
+                payments.release_payment(ip, None, Some(user), sats).await;
             }
         }
         // The daemon answers 4xx only when nothing left its wallet.
@@ -344,6 +343,7 @@ mod tests {
         for (status, paid, reserved) in [
             (StatusCode::OK, 50_000, 50_000),
             (StatusCode::OK, 21_000, 21_000),
+            (StatusCode::OK, 60_000, 60_000),
             (StatusCode::CONFLICT, 0, 0),
             (StatusCode::INTERNAL_SERVER_ERROR, 0, 50_000),
         ] {
@@ -377,12 +377,6 @@ mod tests {
             "That's 50000 sats; you have 40000 left in your 24h limit."
         );
         assert_eq!(usage(&payments).await, (960_000, 960_000));
-    }
-
-    #[test]
-    fn old_address_field_is_still_accepted() {
-        let req: ArkadeRequest = serde_json::from_str(r#"{"address":"tark1x","sats":5}"#).unwrap();
-        assert_eq!((req.destination.as_str(), req.sats), ("tark1x", 5));
     }
 
     #[tokio::test]
