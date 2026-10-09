@@ -3,6 +3,9 @@ use std::env;
 use std::sync::Arc;
 
 use bitcoincore_rpc::Auth;
+use ldk_server_client::client::LdkServerClient;
+use ldk_server_client::ldk_server_grpc::api::GetNodeInfoRequest;
+use ldk_server_client::ldk_server_grpc::types::Network;
 use log::{info, warn};
 use nostr::key::Keys;
 use tonic_openssl_lnd::lnrpc;
@@ -111,57 +114,45 @@ pub async fn setup() -> anyhow::Result<AppState> {
         .unwrap_or_else(|_| "1000".to_string())
         .parse::<u64>()?;
 
-    // Initialize mainnet LND client if reorg or L402 is enabled
-    let needs_mainnet_lnd = reorg_enabled || l402_enabled;
-    let mainnet_lightning_client = if needs_mainnet_lnd {
-        let mainnet_address = env::var("MAINNET_GRPC_HOST").ok();
-        let mainnet_macaroon = env::var("MAINNET_ADMIN_MACAROON_PATH").ok();
-        let mainnet_cert = env::var("MAINNET_TLS_CERT_PATH").ok();
-        let mainnet_port_str = env::var("MAINNET_GRPC_PORT").ok();
+    // Initialize mainnet ldk-server client if reorg or L402 is enabled
+    let needs_mainnet_node = reorg_enabled || l402_enabled;
+    let mainnet_ldk_client = if needs_mainnet_node {
+        let mainnet_url = env::var("MAINNET_LDK_SERVER_URL").ok();
+        let mainnet_macaroon = env::var("MAINNET_LDK_SERVER_MACAROON_PATH").ok();
+        let mainnet_cert = env::var("MAINNET_LDK_SERVER_TLS_CERT_PATH").ok();
 
-        match (
-            mainnet_address,
-            mainnet_macaroon,
-            mainnet_cert,
-            mainnet_port_str,
-        ) {
-            (Some(address), Some(macaroon_file), Some(cert_file), Some(port_str)) => {
-                let port: u32 = port_str
-                    .parse()
-                    .expect("MAINNET_GRPC_PORT must be a number");
+        match (mainnet_url, mainnet_macaroon, mainnet_cert) {
+            (Some(url), Some(macaroon_file), Some(cert_file)) => {
+                info!("Connecting to mainnet ldk-server at {}", url);
 
-                info!("Connecting to mainnet LND at {}:{}", address, port);
+                let macaroon = std::fs::read_to_string(&macaroon_file)
+                    .expect("Failed to read MAINNET_LDK_SERVER_MACAROON_PATH")
+                    .trim()
+                    .to_string();
+                let cert = std::fs::read(&cert_file)
+                    .expect("Failed to read MAINNET_LDK_SERVER_TLS_CERT_PATH");
 
-                let mut mainnet_lnd =
-                    tonic_openssl_lnd::connect(address.clone(), port, cert_file, macaroon_file)
-                        .await
-                        .expect("Failed to connect to mainnet LND");
-
-                let mainnet_client = mainnet_lnd.lightning().clone();
+                let mainnet_client = LdkServerClient::new(url, macaroon, &cert)
+                    .expect("Failed to create mainnet ldk-server client");
 
                 // Verify connection and check it's mainnet
                 let info = mainnet_client
-                    .clone()
-                    .get_info(lnrpc::GetInfoRequest {})
+                    .get_node_info(GetNodeInfoRequest {})
                     .await
-                    .expect("Failed to get mainnet LND info")
-                    .into_inner();
+                    .expect("Failed to get mainnet ldk-server info");
 
-                // Verify this is actually mainnet
-                let is_mainnet = info.chains.iter().any(|chain| chain.network == "mainnet");
-
-                if !is_mainnet {
+                if info.network() != Network::Bitcoin {
                     panic!(
-                        "Mainnet LND connection is not on mainnet! Found chains: {:?}",
-                        info.chains
+                        "Mainnet ldk-server is not on mainnet! Found network: {:?}",
+                        info.network()
                     );
                 }
 
-                info!("Successfully connected to mainnet LND");
+                info!("Successfully connected to mainnet ldk-server");
                 Some(mainnet_client)
             }
             _ => {
-                warn!("Mainnet LND env vars not set. Features requiring mainnet LND will be disabled.");
+                warn!("Mainnet ldk-server env vars not set. Features requiring the mainnet node will be disabled.");
                 None
             }
         }
@@ -170,7 +161,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
     };
 
     // Initialize Bitcoin Core RPC client if reorg is enabled
-    let bitcoin_rpc = if reorg_enabled && mainnet_lightning_client.is_some() {
+    let bitcoin_rpc = if reorg_enabled && mainnet_ldk_client.is_some() {
         let rpc_url = env::var("BITCOIN_RPC_HOST_AND_PORT").ok();
         let rpc_user = env::var("BITCOIN_RPC_USER").ok();
         let rpc_password = env::var("BITCOIN_RPC_PASSWORD").ok();
@@ -202,7 +193,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
     };
 
     // Initialize reorg database if feature enabled
-    let reorg_db = if reorg_enabled && mainnet_lightning_client.is_some() && bitcoin_rpc.is_some() {
+    let reorg_db = if reorg_enabled && mainnet_ldk_client.is_some() && bitcoin_rpc.is_some() {
         let db_path = env::var("REORG_DB_PATH").unwrap_or_else(|_| "reorg.db".to_string());
         match init_reorg_db(&db_path).await {
             Ok(pool) => {
@@ -221,9 +212,9 @@ pub async fn setup() -> anyhow::Result<AppState> {
         None
     };
 
-    // Final check: only enable if mainnet LND, Bitcoin RPC, and DB are all available
+    // Final check: only enable if the mainnet node, Bitcoin RPC, and DB are all available
     let reorg_final_enabled = reorg_enabled
-        && mainnet_lightning_client.is_some()
+        && mainnet_ldk_client.is_some()
         && bitcoin_rpc.is_some()
         && reorg_db.is_some();
 
@@ -251,10 +242,10 @@ pub async fn setup() -> anyhow::Result<AppState> {
     };
 
     // Finalize L402 config
-    let l402_final_enabled = l402_enabled && mainnet_lightning_client.is_some();
+    let l402_final_enabled = l402_enabled && mainnet_ldk_client.is_some();
 
     if l402_enabled && !l402_final_enabled {
-        warn!("L402 feature requested but mainnet LND not configured. L402 disabled.");
+        warn!("L402 feature requested but mainnet ldk-server not configured. L402 disabled.");
     } else if l402_final_enabled {
         info!(
             "L402 authentication enabled with {} sat invoice amount",
@@ -344,7 +335,7 @@ pub async fn setup() -> anyhow::Result<AppState> {
         keys,
         lightning_client,
         router_client,
-        mainnet_lightning_client,
+        mainnet_ldk_client,
         bitcoin_rpc,
         reorg_db,
         network,

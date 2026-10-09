@@ -140,7 +140,8 @@ Premium feature allowing authenticated users to trigger block reorganizations by
 
 - `src/reorg.rs`: Invoice generation and reorg execution
 - Two-step flow: generate mainnet invoice → pay → execute reorg
-- Mainnet LND client for accepting real payments (separate from testnet/regtest faucet LND)
+- Mainnet ldk-server client (`ldk-server-client`) for accepting real payments (separate from the testnet/regtest
+  faucet LND)
 - Bitcoin Core RPC integration for `invalidate_block` calls
 - Works on both regtest and signet networks
 - Progressive pricing: 10k, 20k, 35k, 50k, 75k sats for 1-5 blocks
@@ -152,7 +153,7 @@ Premium feature allowing authenticated users to trigger block reorganizations by
 
 **Environment Variables:**
 
-- `MAINNET_GRPC_HOST/PORT/TLS_CERT_PATH/ADMIN_MACAROON_PATH`: Mainnet LND connection
+- `MAINNET_LDK_SERVER_URL/TLS_CERT_PATH/MACAROON_PATH`: Mainnet ldk-server connection (also used by L402)
 - `REORG_ENABLED`: Feature flag (must be "true")
 - `REORG_COOLDOWN_SECONDS`: Cooldown duration (default: 3600)
 - `REORG_DB_PATH`: SQLite database path (default: "reorg.db")
@@ -161,7 +162,11 @@ Premium feature allowing authenticated users to trigger block reorganizations by
 **How it works:**
 
 - User generates invoice via `/api/reorg/invoice`, stored in SQLite database
-- Background task subscribes to mainnet LND invoice updates
+- Invoices are hold invoices (`Bolt11ReceiveForHash`); the preimage is stored with the reorg
+- Background task subscribes to ldk-server events and claims `PaymentClaimable` payments only while the reorg is
+  pending and inside the 10-minute invoice window; late payments are failed back (LDK accepts payments past the
+  stated invoice expiry, so this is enforced here)
+- Every 30 seconds pending reorgs are reconciled: paid ones execute, missed claimables are claimed, unpaid ones expire
 - When invoice is paid, automatically executes reorg
 - Calls `invalidate_block` on Bitcoin Core to invalidate N blocks from the chain tip
 - On regtest: Chain height decreases; new blocks can be mined to rebuild

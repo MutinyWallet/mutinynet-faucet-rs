@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS reorgs (
     status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'executing', 'uncertain', 'executed', 'skipped', 'expired'
     executed_at INTEGER,  -- timestamp when executed (NULL if not executed)
     invalidated_block_height INTEGER,  -- block height that was invalidated
-    invalidated_block_hash TEXT  -- block hash that was invalidated
+    invalidated_block_hash TEXT,  -- block hash that was invalidated
+    preimage TEXT  -- hex preimage for the hold invoice (NULL for LND-era reorgs)
 );
 
 -- Cooldown tracking (stores timestamp of last executed reorg)

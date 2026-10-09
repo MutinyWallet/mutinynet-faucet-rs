@@ -2,10 +2,16 @@ use anyhow::Result;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::hashes::{hmac, sha256, Hash, HashEngine};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use ldk_server_client::client::LdkServerClient;
+use ldk_server_client::ldk_server_grpc::api::Bolt11ReceiveRequest;
+use ldk_server_client::ldk_server_grpc::types::{
+    bolt11_invoice_description, Bolt11InvoiceDescription,
+};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use tonic_openssl_lnd::lnrpc;
-use tonic_openssl_lnd::LndLightningClient;
+
+/// How long an L402 invoice stays payable.
+pub const L402_INVOICE_EXPIRY_SECS: u32 = 600; // 10 minutes
 
 #[derive(Clone)]
 pub struct L402Config {
@@ -27,20 +33,23 @@ pub struct L402TokenResponse {
 }
 
 pub async fn generate_l402_token(
-    mainnet_client: &LndLightningClient,
+    mainnet_client: &LdkServerClient,
     jwt_secret: &str,
     amount_sats: u64,
 ) -> Result<L402TokenResponse> {
-    let inv = lnrpc::Invoice {
-        memo: "Mutinynet Faucet L402 Auth".to_string(),
-        value: amount_sats as i64,
-        expiry: 600, // 10 minutes
-        ..Default::default()
+    let request = Bolt11ReceiveRequest {
+        amount_msat: Some(amount_sats * 1_000),
+        description: Some(Bolt11InvoiceDescription {
+            kind: Some(bolt11_invoice_description::Kind::Direct(
+                "Mutinynet Faucet L402 Auth".to_string(),
+            )),
+        }),
+        expiry_secs: L402_INVOICE_EXPIRY_SECS,
     };
 
-    let response = mainnet_client.clone().add_invoice(inv).await?.into_inner();
-    let payment_hash = sha256::Hash::from_slice(&response.r_hash)
-        .map_err(|e| anyhow::anyhow!("Invalid payment hash from LND: {}", e))?
+    let response = mainnet_client.bolt11_receive(request).await?;
+    let payment_hash = sha256::Hash::from_str(&response.payment_hash)
+        .map_err(|e| anyhow::anyhow!("Invalid payment hash from ldk-server: {}", e))?
         .to_string();
 
     let now = chrono::Utc::now().timestamp() as usize;
@@ -57,7 +66,7 @@ pub async fn generate_l402_token(
     )?;
 
     Ok(L402TokenResponse {
-        invoice: response.payment_request,
+        invoice: response.invoice,
         token,
         payment_hash: claims.payment_hash,
     })

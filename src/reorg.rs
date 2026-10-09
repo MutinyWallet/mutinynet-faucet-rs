@@ -1,11 +1,20 @@
 use anyhow::{anyhow, Result};
+use bitcoin::hashes::{sha256, Hash};
 use bitcoincore_rpc::RpcApi;
+use ldk_server_client::client::LdkServerClient;
+use ldk_server_client::ldk_server_grpc::api::{
+    Bolt11ClaimForIdRequest, Bolt11FailForIdRequest, Bolt11ReceiveForHashRequest,
+    GetPaymentDetailsRequest,
+};
+use ldk_server_client::ldk_server_grpc::events::{event_envelope::Event, PaymentClaimable};
+use ldk_server_client::ldk_server_grpc::types::{
+    bolt11_invoice_description, Bolt11InvoiceDescription, PaymentStatus,
+};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::{sleep, Duration};
-use tonic_openssl_lnd::lnrpc;
+use tokio::time::{interval, sleep, Duration};
 
 use crate::auth::AuthUser;
 use crate::AppState;
@@ -23,11 +32,43 @@ pub struct ReorgInvoiceResponse {
     pub blocks: u8,
 }
 
+/// How long a reorg invoice stays payable. LDK accepts payments for a while
+/// past the invoice's stated expiry, so reorg invoices are hold invoices and
+/// payments arriving after this window are failed back instead of claimed.
+const REORG_INVOICE_EXPIRY_SECS: u32 = 600; // 10 minutes
+
+/// How often pending reorgs are checked against ldk-server, to expire unpaid
+/// invoices and to catch payments whose events were missed.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+
 #[derive(Debug)]
 struct PendingReorg {
     payment_hash: String,
     blocks: u8,
     username: String,
+    created_at: i64,
+    /// Hex preimage of the hold invoice. None for reorgs created on LND.
+    preimage: Option<String>,
+}
+
+impl PendingReorg {
+    fn is_expired(&self, now: i64) -> bool {
+        now > self.created_at + REORG_INVOICE_EXPIRY_SECS as i64
+    }
+}
+
+type ReorgRow = (String, i64, String, i64, Option<String>);
+
+impl From<ReorgRow> for PendingReorg {
+    fn from((payment_hash, blocks, username, created_at, preimage): ReorgRow) -> Self {
+        PendingReorg {
+            payment_hash,
+            blocks: blocks as u8,
+            username,
+            created_at,
+            preimage,
+        }
+    }
 }
 
 enum InvalidateAttempt {
@@ -79,6 +120,17 @@ pub async fn init_reorg_db(db_path: &str) -> Result<SqlitePool> {
     let schema = include_str!("../schema.sql");
     sqlx::query(schema).execute(&pool).await?;
 
+    // Databases created before the move to ldk-server lack this column.
+    let has_preimage: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM pragma_table_info('reorgs') WHERE name = 'preimage'")
+            .fetch_one(&pool)
+            .await?;
+    if has_preimage.0 == 0 {
+        sqlx::query("ALTER TABLE reorgs ADD COLUMN preimage TEXT")
+            .execute(&pool)
+            .await?;
+    }
+
     info!("Reorg database initialized at {}", db_path);
     Ok(pool)
 }
@@ -109,15 +161,17 @@ async fn check_cooldown(pool: &SqlitePool, cooldown_seconds: u64) -> Result<()> 
 async fn store_pending_reorg(
     pool: &SqlitePool,
     payment_hash: &str,
+    preimage: &str,
     blocks: u8,
     username: &str,
 ) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
 
     sqlx::query(
-        "INSERT INTO reorgs (payment_hash, blocks, username, created_at) VALUES (?, ?, ?, ?)",
+        "INSERT INTO reorgs (payment_hash, preimage, blocks, username, created_at) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(payment_hash)
+    .bind(preimage)
     .bind(blocks as i64)
     .bind(username)
     .bind(now)
@@ -127,38 +181,35 @@ async fn store_pending_reorg(
     Ok(())
 }
 
-/// Get a pending reorg by payment hash
-async fn get_pending_reorg(pool: &SqlitePool, payment_hash: &str) -> Result<Option<PendingReorg>> {
-    let result = sqlx::query_as::<_, (String, i64, String)>(
-        "SELECT payment_hash, blocks, username FROM reorgs WHERE payment_hash = ? AND status = 'pending'",
+/// Get a reorg of any status by payment hash, along with its status
+async fn get_reorg(
+    pool: &SqlitePool,
+    payment_hash: &str,
+) -> Result<Option<(PendingReorg, String)>> {
+    let result = sqlx::query_as::<_, (String, i64, String, i64, Option<String>, String)>(
+        "SELECT payment_hash, blocks, username, created_at, preimage, status FROM reorgs WHERE payment_hash = ?",
     )
     .bind(payment_hash)
     .fetch_optional(pool)
     .await?;
 
-    Ok(result.map(|(payment_hash, blocks, username)| PendingReorg {
-        payment_hash,
-        blocks: blocks as u8,
-        username,
-    }))
+    Ok(result.map(
+        |(payment_hash, blocks, username, created_at, preimage, status)| {
+            let row = (payment_hash, blocks, username, created_at, preimage);
+            (row.into(), status)
+        },
+    ))
 }
 
 /// Get all pending reorgs
 async fn get_all_reorgs(pool: &SqlitePool) -> Result<Vec<PendingReorg>> {
-    let results = sqlx::query_as::<_, (String, i64, String)>(
-        "SELECT payment_hash, blocks, username FROM reorgs WHERE status = 'pending'",
+    let results = sqlx::query_as::<_, ReorgRow>(
+        "SELECT payment_hash, blocks, username, created_at, preimage FROM reorgs WHERE status = 'pending'",
     )
     .fetch_all(pool)
     .await?;
 
-    Ok(results
-        .into_iter()
-        .map(|(payment_hash, blocks, username)| PendingReorg {
-            payment_hash,
-            blocks: blocks as u8,
-            username,
-        })
-        .collect())
+    Ok(results.into_iter().map(PendingReorg::from).collect())
 }
 
 /// Update reorg status (for accounting - never delete records)
@@ -200,7 +251,7 @@ pub async fn generate_reorg_invoice(
         return Err(anyhow!("Blocks must be between 1 and 5"));
     }
 
-    // Keep the availability check, LND invoice creation, and pending-row
+    // Keep the availability check, invoice creation, and pending-row
     // insert in one process-wide critical section. Without this, concurrent
     // callers can both observe no pending reorg before either row is stored.
     let _operation_guard = state.reorg_operation_lock.lock().await;
@@ -234,11 +285,11 @@ pub async fn generate_reorg_invoice(
         ));
     }
 
-    // Generate invoice on mainnet LND
+    // Generate a hold invoice on the mainnet node
     let mainnet_client = state
-        .mainnet_lightning_client
+        .mainnet_ldk_client
         .as_ref()
-        .ok_or_else(|| anyhow!("Mainnet LND client not configured"))?;
+        .ok_or_else(|| anyhow!("Mainnet node not configured"))?;
 
     let blocks_word = if request.blocks == 1 {
         "block"
@@ -250,23 +301,29 @@ pub async fn generate_reorg_invoice(
         request.blocks, blocks_word, user.username
     );
 
-    let add_invoice_request = lnrpc::Invoice {
-        memo,
-        value: *amount_sats as i64,
-        expiry: 600, // 10 minutes
-        ..Default::default()
-    };
+    let preimage: [u8; 32] = rand::random();
+    let payment_hash = sha256::Hash::hash(&preimage).to_string();
 
     let response = mainnet_client
-        .clone()
-        .add_invoice(add_invoice_request)
-        .await?
-        .into_inner();
-
-    let payment_hash = hex::encode(&response.r_hash);
+        .bolt11_receive_for_hash(Bolt11ReceiveForHashRequest {
+            amount_msat: Some(*amount_sats * 1_000),
+            description: Some(Bolt11InvoiceDescription {
+                kind: Some(bolt11_invoice_description::Kind::Direct(memo)),
+            }),
+            expiry_secs: REORG_INVOICE_EXPIRY_SECS,
+            payment_hash: payment_hash.clone(),
+        })
+        .await?;
 
     // Store in database
-    store_pending_reorg(pool, &payment_hash, request.blocks, &user.username).await?;
+    store_pending_reorg(
+        pool,
+        &payment_hash,
+        &hex::encode(preimage),
+        request.blocks,
+        &user.username,
+    )
+    .await?;
 
     info!(
         "Generated reorg invoice for user {}: {} blocks, payment_hash: {}",
@@ -274,7 +331,7 @@ pub async fn generate_reorg_invoice(
     );
 
     Ok(ReorgInvoiceResponse {
-        invoice: response.payment_request,
+        invoice: response.invoice,
         payment_hash,
         amount_sats: *amount_sats,
         blocks: request.blocks,
@@ -455,7 +512,7 @@ async fn execute_reorg_internal(state: &AppState, pending_reorg: &PendingReorg) 
     Ok(())
 }
 
-/// Background task that subscribes to LND invoice updates and executes reorgs
+/// Background task that watches mainnet node payments and executes reorgs
 pub async fn start_reorg_invoice_listener(state: AppState) {
     info!("Starting reorg invoice listener");
 
@@ -479,68 +536,202 @@ async fn run_invoice_listener(state: &AppState) -> Result<()> {
     }
 
     let mainnet_client = state
-        .mainnet_lightning_client
+        .mainnet_ldk_client
         .as_ref()
-        .ok_or_else(|| anyhow!("Mainnet LND client not configured"))?;
+        .ok_or_else(|| anyhow!("Mainnet node not configured"))?;
 
     let pool = state
         .reorg_db
         .as_ref()
         .ok_or_else(|| anyhow!("Reorg database not initialized"))?;
 
-    // On startup, check all pending reorgs for settled invoices
-    info!("Checking pending reorgs for settled invoices...");
-    let pending = get_all_reorgs(pool).await?;
+    // Subscribe before the first reconcile so no payment slips between them.
+    info!("Subscribing to mainnet ldk-server events...");
+    let mut events = mainnet_client.subscribe_events().await?;
 
-    // Find all settled invoices
-    let mut settled_reorgs = Vec::new();
-
-    for pending_reorg in pending {
-        let payment_hash = hex::decode(&pending_reorg.payment_hash)?;
-
-        // Check if invoice is settled
-        let lookup_request = lnrpc::PaymentHash {
-            r_hash: payment_hash.clone(),
-            ..Default::default()
-        };
-
-        match mainnet_client.clone().lookup_invoice(lookup_request).await {
-            Ok(response) => {
-                let invoice = response.into_inner();
-                if invoice.state == lnrpc::invoice::InvoiceState::Settled as i32 {
-                    info!(
-                        "Found settled invoice for pending reorg: {} blocks for user {}",
-                        pending_reorg.blocks, pending_reorg.username
-                    );
-                    settled_reorgs.push(pending_reorg);
-                } else if invoice.state == lnrpc::invoice::InvoiceState::Canceled as i32 {
-                    info!(
-                        "Found expired invoice for pending reorg: {} blocks for user {} (payment_hash: {})",
-                        pending_reorg.blocks, pending_reorg.username, pending_reorg.payment_hash
-                    );
-                    if let Err(e) = update_reorg_status(
-                        pool,
-                        &pending_reorg.payment_hash,
-                        "expired",
-                        None,
-                        None,
-                        None,
-                    )
-                    .await
-                    {
-                        error!(
-                            "Failed to mark invoice as expired {}: {}",
-                            pending_reorg.payment_hash, e
-                        );
-                    }
+    // The first tick fires immediately, so pending reorgs are reconciled on
+    // every (re)connect.
+    let mut reconcile = interval(RECONCILE_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = reconcile.tick() => {
+                if let Err(e) = reconcile_pending_reorgs(state, mainnet_client, pool).await {
+                    error!("Failed to reconcile pending reorgs: {}", e);
                 }
             }
+            event = events.next_message() => {
+                let event = event.ok_or_else(|| anyhow!("ldk-server event stream ended"))??;
+                if let Some(Event::PaymentClaimable(claimable)) = event.event {
+                    handle_claimable(state, mainnet_client, pool, claimable).await;
+                }
+            }
+        }
+    }
+}
+
+/// Claim the payment for `reorg` if its invoice is still payable, otherwise
+/// fail it back so the buyer is refunded. Returns whether it was claimed.
+async fn claim_or_fail(
+    state: &AppState,
+    client: &LdkServerClient,
+    reorg: &PendingReorg,
+    is_pending: bool,
+    amount_msat: u64,
+) -> Result<bool> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let price_msat = state
+        .reorg_config
+        .pricing
+        .get(&reorg.blocks)
+        .map(|sats| sats * 1_000);
+
+    let payable = is_pending
+        && !reorg.is_expired(now)
+        && price_msat.is_some_and(|price| amount_msat >= price);
+
+    // Bolt11 payment ids are the payment hash.
+    match reorg.preimage.as_ref().filter(|_| payable) {
+        Some(preimage) => {
+            client
+                .bolt11_claim_for_id(Bolt11ClaimForIdRequest {
+                    payment_id: reorg.payment_hash.clone(),
+                    claimable_amount_msat: Some(amount_msat),
+                    preimage: preimage.clone(),
+                })
+                .await?;
+            Ok(true)
+        }
+        None => {
+            client
+                .bolt11_fail_for_id(Bolt11FailForIdRequest {
+                    payment_id: reorg.payment_hash.clone(),
+                })
+                .await?;
+            Ok(false)
+        }
+    }
+}
+
+/// Handle a payment arriving for a hold invoice. Payments for invoices that
+/// aren't ours are left alone, since other services may share the node.
+async fn handle_claimable(
+    state: &AppState,
+    client: &LdkServerClient,
+    pool: &SqlitePool,
+    claimable: PaymentClaimable,
+) {
+    let (reorg, status) = match get_reorg(pool, &claimable.payment_id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => return,
+        Err(e) => {
+            // Left unhandled, LDK fails the payment back at its claim deadline.
+            error!(
+                "Failed to look up reorg for payment {}: {}",
+                claimable.payment_id, e
+            );
+            return;
+        }
+    };
+
+    match claim_or_fail(
+        state,
+        client,
+        &reorg,
+        status == "pending",
+        claimable.claimable_amount_msat,
+    )
+    .await
+    {
+        Ok(true) => {
+            info!(
+                "Invoice paid for reorg: {} blocks for user {}",
+                reorg.blocks, reorg.username
+            );
+            if let Err(e) = execute_reorg_internal(state, &reorg).await {
+                // Still pending, so the next reconcile retries it.
+                error!("Failed to execute reorg: {}", e);
+            } else {
+                info!(
+                    "Successfully executed reorg for payment {}",
+                    reorg.payment_hash
+                );
+            }
+        }
+        Ok(false) => warn!(
+            "Failed back payment for {} reorg (payment_hash: {})",
+            status, reorg.payment_hash
+        ),
+        Err(e) => error!(
+            "Failed to claim or fail payment {}: {}",
+            reorg.payment_hash, e
+        ),
+    }
+}
+
+async fn mark_expired(pool: &SqlitePool, reorg: &PendingReorg) {
+    info!(
+        "Invoice expired for reorg: {} blocks for user {} (payment_hash: {})",
+        reorg.blocks, reorg.username, reorg.payment_hash
+    );
+    if let Err(e) =
+        update_reorg_status(pool, &reorg.payment_hash, "expired", None, None, None).await
+    {
+        error!(
+            "Failed to mark invoice as expired {}: {}",
+            reorg.payment_hash, e
+        );
+    }
+}
+
+/// Bring pending reorgs in line with ldk-server: execute paid reorgs, claim
+/// payments whose events were missed, and expire unpaid invoices.
+async fn reconcile_pending_reorgs(
+    state: &AppState,
+    client: &LdkServerClient,
+    pool: &SqlitePool,
+) -> Result<()> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let mut settled_reorgs = Vec::new();
+
+    for pending_reorg in get_all_reorgs(pool).await? {
+        let payment = match client
+            .get_payment_details(GetPaymentDetailsRequest {
+                payment_id: pending_reorg.payment_hash.clone(),
+            })
+            .await
+        {
+            Ok(response) => response.payment,
             Err(e) => {
                 warn!(
                     "Failed to lookup invoice {}: {}",
                     pending_reorg.payment_hash, e
                 );
+                continue;
             }
+        };
+
+        match payment.as_ref().map(|p| p.status()) {
+            Some(PaymentStatus::Succeeded) => {
+                info!(
+                    "Found settled invoice for pending reorg: {} blocks for user {}",
+                    pending_reorg.blocks, pending_reorg.username
+                );
+                settled_reorgs.push(pending_reorg);
+            }
+            // Claimable, but its PaymentClaimable event was missed.
+            Some(PaymentStatus::Pending) => {
+                let amount_msat = payment.and_then(|p| p.amount_msat).unwrap_or(0);
+                match claim_or_fail(state, client, &pending_reorg, true, amount_msat).await {
+                    Ok(true) => settled_reorgs.push(pending_reorg),
+                    Ok(false) => {}
+                    Err(e) => warn!(
+                        "Failed to claim or fail payment {}: {}",
+                        pending_reorg.payment_hash, e
+                    ),
+                }
+            }
+            _ if pending_reorg.is_expired(now) => mark_expired(pool, &pending_reorg).await,
+            _ => {}
         }
     }
 
@@ -590,65 +781,12 @@ async fn run_invoice_listener(state: &AppState) -> Result<()> {
         }
     }
 
-    // Subscribe to invoice updates
-    info!("Subscribing to mainnet LND invoice updates...");
-    let subscribe_request = lnrpc::InvoiceSubscription {
-        add_index: 0,
-        settle_index: 0,
-    };
-
-    let mut stream = mainnet_client
-        .clone()
-        .subscribe_invoices(subscribe_request)
-        .await?
-        .into_inner();
-
-    // Process invoice updates
-    while let Some(invoice) = stream.message().await? {
-        let payment_hash = hex::encode(&invoice.r_hash);
-
-        // Process settled invoices
-        if invoice.state == lnrpc::invoice::InvoiceState::Settled as i32 {
-            // Check if this is a pending reorg
-            if let Ok(Some(pending_reorg)) = get_pending_reorg(pool, &payment_hash).await {
-                info!(
-                    "Invoice settled for reorg: {} blocks for user {}",
-                    pending_reorg.blocks, pending_reorg.username
-                );
-
-                // Execute the reorg
-                if let Err(e) = execute_reorg_internal(state, &pending_reorg).await {
-                    error!("Failed to execute reorg: {}", e);
-                    // Keep in pending so we can retry later
-                } else {
-                    info!("Successfully executed reorg for payment {}", payment_hash);
-                }
-            }
-        }
-        // Process canceled/expired invoices
-        else if invoice.state == lnrpc::invoice::InvoiceState::Canceled as i32 {
-            // Check if this is a pending reorg
-            if let Ok(Some(pending_reorg)) = get_pending_reorg(pool, &payment_hash).await {
-                info!(
-                    "Invoice expired for reorg: {} blocks for user {} (payment_hash: {})",
-                    pending_reorg.blocks, pending_reorg.username, payment_hash
-                );
-
-                if let Err(e) =
-                    update_reorg_status(pool, &payment_hash, "expired", None, None, None).await
-                {
-                    error!("Failed to mark invoice as expired {}: {}", payment_hash, e);
-                }
-            }
-        }
-    }
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::reorg_target_height;
+    use super::{init_reorg_db, reorg_target_height, PendingReorg, REORG_INVOICE_EXPIRY_SECS};
 
     #[test]
     fn targets_exact_number_of_tip_blocks() {
@@ -656,5 +794,57 @@ mod tests {
         assert_eq!(reorg_target_height(100, 5), Some(96));
         assert_eq!(reorg_target_height(4, 5), None);
         assert_eq!(reorg_target_height(100, 0), None);
+    }
+
+    #[test]
+    fn invoice_expires_after_window() {
+        let reorg = PendingReorg {
+            payment_hash: String::new(),
+            blocks: 1,
+            username: String::new(),
+            created_at: 1_000,
+            preimage: None,
+        };
+        let deadline = 1_000 + REORG_INVOICE_EXPIRY_SECS as i64;
+        assert!(!reorg.is_expired(deadline));
+        assert!(reorg.is_expired(deadline + 1));
+    }
+
+    #[tokio::test]
+    async fn adds_preimage_column_to_existing_db() {
+        let path = std::env::temp_dir().join(format!("reorg-migrate-{}.db", rand::random::<u64>()));
+        let db_path = path.to_str().unwrap();
+        std::fs::File::create(&path).unwrap();
+
+        // Schema from before the move to ldk-server.
+        let pool = sqlx::SqlitePool::connect(&format!("sqlite:{db_path}"))
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE reorgs (payment_hash TEXT PRIMARY KEY, blocks INTEGER NOT NULL, \
+             username TEXT NOT NULL, created_at INTEGER NOT NULL, \
+             status TEXT NOT NULL DEFAULT 'pending', executed_at INTEGER, \
+             invalidated_block_height INTEGER, invalidated_block_hash TEXT)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        // Running twice must not try to add the column again.
+        init_reorg_db(db_path).await.unwrap().close().await;
+        let pool = init_reorg_db(db_path).await.unwrap();
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pragma_table_info('reorgs') WHERE name = 'preimage'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+
+        pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{db_path}{suffix}"));
+        }
     }
 }

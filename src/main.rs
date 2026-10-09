@@ -11,6 +11,9 @@ use axum::{
     Extension, Json, Router,
 };
 use jsonwebtoken::{encode, EncodingKey, Header};
+use ldk_server_client::client::LdkServerClient;
+use ldk_server_client::ldk_server_grpc::api::GetPaymentDetailsRequest;
+use ldk_server_client::ldk_server_grpc::types::{payment_kind, PaymentStatus};
 use lightning_invoice::Bolt11Invoice;
 use lnurl::withdraw::WithdrawalResponse;
 use lnurl::Tag;
@@ -71,7 +74,7 @@ pub struct AppState {
     network: bitcoin::Network,
     lightning_client: LndLightningClient,
     router_client: LndRouterClient,
-    mainnet_lightning_client: Option<LndLightningClient>,
+    mainnet_ldk_client: Option<LdkServerClient>,
     bitcoin_rpc: Option<Arc<bitcoincore_rpc::Client>>,
     reorg_db: Option<SqlitePool>,
     /// Serializes reorg invoice creation and execution so the database checks
@@ -120,7 +123,7 @@ impl AppState {
         keys: Keys,
         lightning_client: LndLightningClient,
         router_client: LndRouterClient,
-        mainnet_lightning_client: Option<LndLightningClient>,
+        mainnet_ldk_client: Option<LdkServerClient>,
         bitcoin_rpc: Option<Arc<bitcoincore_rpc::Client>>,
         reorg_db: Option<SqlitePool>,
         network: bitcoin::Network,
@@ -144,7 +147,7 @@ impl AppState {
             network,
             lightning_client,
             router_client,
-            mainnet_lightning_client,
+            mainnet_ldk_client,
             bitcoin_rpc,
             reorg_db,
             reorg_operation_lock: Arc::new(Mutex::new(())),
@@ -811,9 +814,9 @@ async fn generate_l402_challenge(state: &AppState) -> Result<L402HandlerResponse
     }
 
     let mainnet_client = state
-        .mainnet_lightning_client
+        .mainnet_ldk_client
         .as_ref()
-        .ok_or_else(|| AppError::new("Mainnet LND not configured"))?;
+        .ok_or_else(|| AppError::new("Mainnet node not configured"))?;
 
     let response = generate_l402_token(
         mainnet_client,
@@ -846,7 +849,7 @@ async fn l402_challenge_handler(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     // Unauthenticated invoice creation is rate-limited per IP to protect
-    // the (mainnet) LND node from invoice spam.
+    // the mainnet node from invoice spam.
     let key = format!("l402:{}", client_ip(&headers, peer, state.trusted_gateway));
     if !state
         .payments
@@ -909,7 +912,7 @@ async fn l402_check_handler(
         return Err(AppError::new("L402 authentication is not enabled"));
     }
 
-    // Each check hits LND lookup_invoice; rate-limit per IP.
+    // Each check hits the mainnet node; rate-limit per IP.
     let key = format!(
         "l402check:{}",
         client_ip(&headers, peer, state.trusted_gateway)
@@ -923,9 +926,9 @@ async fn l402_check_handler(
     }
 
     let mainnet_client = state
-        .mainnet_lightning_client
+        .mainnet_ldk_client
         .as_ref()
-        .ok_or_else(|| AppError::new("Mainnet LND not configured"))?;
+        .ok_or_else(|| AppError::new("Mainnet node not configured"))?;
 
     // Decode the JWT to get the payment_hash
     let token_data = jsonwebtoken::decode::<l402::L402Claims>(
@@ -936,22 +939,21 @@ async fn l402_check_handler(
     .map_err(|_| AppError::new("Invalid token"))?;
 
     let payment_hash_hex = &token_data.claims.payment_hash;
-    let payment_hash_bytes =
-        hex::decode(payment_hash_hex).map_err(|_| AppError::new("Invalid payment hash"))?;
+    if hex::decode(payment_hash_hex).map_or(true, |b| b.len() != 32) {
+        return Err(AppError::new("Invalid payment hash"));
+    }
 
-    let lookup_request = tonic_openssl_lnd::lnrpc::PaymentHash {
-        r_hash: payment_hash_bytes,
-        ..Default::default()
-    };
-
-    let invoice = mainnet_client
-        .clone()
-        .lookup_invoice(lookup_request)
+    // ldk-server keys inbound BOLT11 payments by their payment hash.
+    let payment = mainnet_client
+        .get_payment_details(GetPaymentDetailsRequest {
+            payment_id: payment_hash_hex.clone(),
+        })
         .await
         .map_err(|_| AppError::new("Failed to lookup invoice"))?
-        .into_inner();
+        .payment;
 
-    if invoice.state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Settled as i32 {
+    let status = payment.as_ref().map(|p| p.status());
+    if status == Some(PaymentStatus::Succeeded) {
         // The token is public by design (it travels in URLs and the 402
         // challenge), so the preimage is only returned alongside proof that
         // the caller requested this invoice. Anyone else learns the preimage
@@ -964,16 +966,28 @@ async fn l402_check_handler(
             });
 
         if claimed {
+            let preimage = payment
+                .and_then(|p| p.kind?.kind)
+                .and_then(|kind| match kind {
+                    payment_kind::Kind::Bolt11(bolt11) => bolt11.preimage,
+                    _ => None,
+                })
+                .ok_or_else(|| AppError::new("Preimage unavailable"))?;
             Ok(Json(json!({
                 "status": "settled",
-                "preimage": hex::encode(&invoice.r_preimage),
+                "preimage": preimage,
             })))
         } else {
             Ok(Json(json!({
                 "status": "settled",
             })))
         }
-    } else if invoice.state == tonic_openssl_lnd::lnrpc::invoice::InvoiceState::Canceled as i32 {
+    } else if status == Some(PaymentStatus::Failed)
+        || chrono::Utc::now().timestamp() as usize
+            > token_data.claims.iat + l402::L402_INVOICE_EXPIRY_SECS as usize
+    {
+        // ldk-server has no record of an invoice until it is paid, so
+        // expiry is derived from when the token was issued.
         Ok(Json(json!({
             "status": "expired",
         })))

@@ -15,6 +15,7 @@ tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tonic_openssl_lnd = "0.2.0"
+ldk-server-client = { git = "https://github.com/lightningdevkit/ldk-server", rev = "21a903ccb89496285c58a55ffdce42a9f0353a05" }
 dotenvy = "0.15.7"
 lnurl-rs = { version = "0.10.0", default-features = false, features = ["async-https-native"] }
 hex = "0.4.3"
