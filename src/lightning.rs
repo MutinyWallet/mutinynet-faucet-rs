@@ -137,6 +137,19 @@ pub(crate) async fn get_lnurl_invoice(
         .await?)
 }
 
+/// An LNURL or Lightning address, with any `lightning:` prefix stripped.
+pub(crate) fn parse_lnurl(input: &str) -> Option<LnUrl> {
+    let target = input
+        .strip_prefix("lightning:")
+        .or_else(|| input.strip_prefix("LIGHTNING:"))
+        .unwrap_or(input);
+    LnUrl::decode(target.to_owned()).ok().or_else(|| {
+        LightningAddress::from_str(target)
+            .ok()
+            .map(|address| address.lnurl())
+    })
+}
+
 /// Reject invoices without an amount or with an amount above `max_msats`.
 pub(crate) fn validate_invoice_amount(
     invoice: &Bolt11Invoice,
@@ -151,7 +164,7 @@ pub(crate) fn validate_invoice_amount(
     Ok(())
 }
 
-fn validate_lnurl_invoice_amount(
+pub(crate) fn validate_lnurl_invoice_amount(
     invoice: &Bolt11Invoice,
     requested_msats: u64,
 ) -> anyhow::Result<()> {
@@ -191,15 +204,7 @@ pub async fn pay_lightning(
 ) -> anyhow::Result<String> {
     let params = parse_payment_instructions(bolt11, state.network).await.ok();
 
-    let lnurl_target = bolt11
-        .strip_prefix("lightning:")
-        .or_else(|| bolt11.strip_prefix("LIGHTNING:"))
-        .unwrap_or(bolt11);
-    let lnurl = LnUrl::decode(lnurl_target.to_owned()).ok().or_else(|| {
-        LightningAddress::from_str(lnurl_target)
-            .ok()
-            .map(|address| address.lnurl())
-    });
+    let lnurl = parse_lnurl(bolt11);
 
     let invoice = if let Some(invoice) = params.and_then(|params| params.invoice) {
         validate_invoice_amount(&invoice, MAX_SEND_AMOUNT_MSATS)?;

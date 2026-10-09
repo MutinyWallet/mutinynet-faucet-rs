@@ -1,10 +1,19 @@
+use std::future::Future;
+use std::str::FromStr;
+
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use lightning_invoice::Bolt11Invoice;
+use lnurl::LnUrlResponse;
 use log::info;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthUser;
+use crate::lightning::{
+    get_lnurl_invoice, make_lnurl_request, parse_lnurl, validate_lnurl_invoice_amount,
+};
+use crate::payments::PaymentsByIp;
 use crate::{AppState, MAX_SEND_AMOUNT};
 
 #[derive(Clone, Deserialize)]
@@ -13,9 +22,13 @@ pub struct ArkadeRequest {
     pub sats: u64,
 }
 
-#[derive(Clone, Serialize)]
+/// Optional because a pre-0.2.0 daemon answers with `txid` only.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ArkadeResponse {
-    pub txid: String,
+    pub txid: Option<String>,
+    pub rail: Option<String>,
+    pub status: Option<String>,
+    pub amount: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -44,6 +57,13 @@ impl IntoResponse for ArkadeError {
     }
 }
 
+fn client_error(status: StatusCode, message: String) -> ArkadeError {
+    ArkadeError {
+        status,
+        error: anyhow::anyhow!(message),
+    }
+}
+
 pub async fn dispense_arkade(
     state: &AppState,
     x_forwarded_for: &str,
@@ -62,59 +82,117 @@ pub async fn dispense_arkade(
         return Err(anyhow::anyhow!("max amount is {MAX_SEND_AMOUNT}").into());
     }
 
-    // Atomically check the limits and record the payment before dispensing.
-    // Premium users bypass the limit but are still tracked.
-    if user.is_premium {
-        state
-            .payments
-            .add_payment(x_forwarded_for, None, Some(user), payload.sats)
-            .await;
-    } else if !state
-        .payments
-        .try_reserve_payment(x_forwarded_for, None, Some(user), payload.sats)
-        .await
-    {
-        return Err(anyhow::anyhow!("Too many payments").into());
-    }
+    let requested = payload.address.trim().trim_matches('"');
 
     // Keep connection details and server error bodies out of client responses.
     let daemon_url = daemon_url.trim_end_matches('/');
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(anyhow::Error::from)?;
-    let mut req = client
-        .post(format!("{daemon_url}/send"))
-        .json(&serde_json::json!({ "address": payload.address, "sats": payload.sats }));
+    let send = async {
+        let destination = resolve_lnurl(requested, payload.sats).await?;
+        let mut req = client
+            .post(format!("{daemon_url}/send"))
+            .json(&serde_json::json!({ "address": destination, "sats": payload.sats }));
+        if let Some(token) = state.arkade_internal_token.as_deref() {
+            req = req.header("X-Internal-Token", token);
+        }
+        send_to_daemon(req).await
+    };
 
-    if let Some(token) = state.arkade_internal_token.as_deref() {
-        req = req.header("X-Internal-Token", token);
-    }
+    let paid = send_reserved(&state.payments, x_forwarded_for, user, payload.sats, send).await?;
+    let amount = paid.amount.unwrap_or(payload.sats);
 
-    let json = send_request(req).await?;
-    let txid = json
-        .get("txid")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("arkade daemon returned no txid"))?
-        .to_string();
-
-    info!(
-        "arkade dispensed {} sats to {}",
-        payload.sats, payload.address
-    );
+    info!("arkade dispensed {amount} sats to {requested}");
 
     if let Some(tx) = &state.analytics_writer {
         crate::analytics::record_payment(
             tx,
             "arkade",
-            payload.sats,
+            amount,
             Some(&user.username),
             x_forwarded_for,
-            Some(&payload.address),
+            Some(requested),
         );
     }
 
-    Ok(ArkadeResponse { txid })
+    Ok(paid)
+}
+
+/// Lightning addresses and LNURL-pay become a bolt11 for `sats`; other destinations pass through.
+async fn resolve_lnurl(destination: &str, sats: u64) -> Result<String, ArkadeError> {
+    let Some(lnurl) = parse_lnurl(destination) else {
+        return Ok(destination.to_owned());
+    };
+    let invoice = async {
+        let LnUrlResponse::LnUrlPayResponse(pay) = make_lnurl_request(&lnurl.url).await? else {
+            anyhow::bail!("That LNURL is not a pay request.");
+        };
+        let msats = sats * 1_000;
+        if msats < pay.min_sendable || msats > pay.max_sendable {
+            anyhow::bail!(
+                "This Lightning address accepts {}–{} sats.",
+                pay.min_sendable.div_ceil(1_000),
+                pay.max_sendable / 1_000
+            );
+        }
+        let invoice =
+            Bolt11Invoice::from_str(get_lnurl_invoice(&pay, msats, None).await?.invoice())
+                .map_err(|error| anyhow::anyhow!("invalid invoice: {error:?}"))?;
+        validate_lnurl_invoice_amount(&invoice, msats)?;
+        Ok(invoice.to_string())
+    }
+    .await;
+    // Nothing has been paid yet, so any failure here is a 4xx that releases the reservation.
+    invoice.map_err(|error| client_error(StatusCode::BAD_REQUEST, error.to_string()))
+}
+
+/// Reserves `sats` before `send` is first polled, then settles the reservation on its answer.
+async fn send_reserved(
+    payments: &PaymentsByIp,
+    ip: &str,
+    user: &AuthUser,
+    sats: u64,
+    send: impl Future<Output = Result<ArkadeResponse, ArkadeError>>,
+) -> Result<ArkadeResponse, ArkadeError> {
+    // Premium users bypass the limit but are still tracked.
+    if user.is_premium {
+        payments.add_payment(ip, None, Some(user), sats).await;
+    } else if !payments
+        .try_reserve_payment(ip, None, Some(user), sats)
+        .await
+    {
+        let (ip_used, user_used) = payments.get_usage(ip, Some(user)).await;
+        let remaining = MAX_SEND_AMOUNT.saturating_sub(ip_used.max(user_used));
+        return Err(client_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("That's {sats} sats; you have {remaining} left in your 24h limit."),
+        ));
+    }
+
+    let result = send.await;
+    match &result {
+        // Count what was paid; adding before releasing never shows a too-low total in between.
+        Ok(paid) => {
+            if let Some(amount) = paid.amount.filter(|amount| *amount != sats) {
+                payments.add_payment(ip, None, Some(user), amount).await;
+                payments.release_payment(ip, None, Some(user), sats).await;
+            }
+        }
+        // The daemon answers 4xx only when nothing left its wallet.
+        Err(error) if error.status.is_client_error() => {
+            payments.release_payment(ip, None, Some(user), sats).await;
+        }
+        Err(_) => {}
+    }
+    result
+}
+
+async fn send_to_daemon(req: reqwest::RequestBuilder) -> Result<ArkadeResponse, ArkadeError> {
+    let json = send_request(req).await?;
+    serde_json::from_value(json)
+        .map_err(|e| anyhow::anyhow!("arkade daemon returned an unexpected response: {e}").into())
 }
 
 async fn send_request(req: reqwest::RequestBuilder) -> Result<serde_json::Value, ArkadeError> {
@@ -243,5 +321,95 @@ mod tests {
             "arkade dispenser unavailable",
         )
         .await;
+    }
+
+    const IP: &str = "1.2.3.4";
+
+    fn alice() -> AuthUser {
+        AuthUser {
+            username: "alice".into(),
+            is_premium: false,
+        }
+    }
+
+    /// A request to a daemon whose /send answers `status`, reporting `amount` paid.
+    fn fake_daemon(status: StatusCode, amount: u64) -> reqwest::RequestBuilder {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/send",
+            post(move || async move {
+                let paid = serde_json::json!({ "rail": "ark", "status": "settled", "amount": amount, "txid": "t1", "swapId": "s1" });
+                (status, Json(paid))
+            }),
+        );
+        tokio::spawn(
+            axum::Server::from_tcp(listener)
+                .unwrap()
+                .serve(app.into_make_service()),
+        );
+        reqwest::Client::new().post(format!("http://{address}/send"))
+    }
+
+    async fn usage(payments: &PaymentsByIp) -> (u64, u64) {
+        payments.get_usage(IP, Some(&alice())).await
+    }
+
+    #[tokio::test]
+    async fn the_daemon_answer_settles_a_50k_reservation() {
+        // (daemon status, sats it reports paid, sats left reserved)
+        for (status, paid, reserved) in [
+            (StatusCode::OK, 50_000, 50_000),
+            (StatusCode::OK, 21_000, 21_000),
+            (StatusCode::OK, 60_000, 60_000),
+            (StatusCode::CONFLICT, 0, 0),
+            (StatusCode::INTERNAL_SERVER_ERROR, 0, 50_000),
+        ] {
+            let payments = PaymentsByIp::new();
+            let send = send_to_daemon(fake_daemon(status, paid));
+            match send_reserved(&payments, IP, &alice(), 50_000, send).await {
+                Ok(json) => {
+                    assert!(status.is_success() && json.txid.as_deref() == Some("t1"));
+                    assert!(serde_json::to_value(&json).unwrap().get("swapId").is_none());
+                }
+                Err(error) => assert_eq!(error.status, status),
+            }
+            assert_eq!(usage(&payments).await, (reserved, reserved), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn over_quota_says_what_is_left_without_starting_the_send() {
+        let payments = PaymentsByIp::new();
+        payments
+            .add_payment(IP, None, Some(&alice()), 960_000)
+            .await;
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let send = async {
+            started.store(true, std::sync::atomic::Ordering::SeqCst);
+            send_to_daemon(fake_daemon(StatusCode::OK, 50_000)).await
+        };
+        let err = send_reserved(&payments, IP, &alice(), 50_000, send)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            err.error.to_string(),
+            "That's 50000 sats; you have 40000 left in your 24h limit."
+        );
+        assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(usage(&payments).await, (960_000, 960_000));
+    }
+
+    #[tokio::test]
+    async fn non_lnurl_destinations_pass_through() {
+        assert_eq!(resolve_lnurl("tark1x", 5).await.unwrap(), "tark1x");
+    }
+
+    #[tokio::test]
+    async fn a_failed_lightning_address_lookup_releases_the_quota() {
+        let error = resolve_lnurl("alice@example.invalid", 5).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 }
