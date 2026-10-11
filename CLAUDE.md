@@ -47,11 +47,11 @@ The application is built around a shared state struct containing:
 - **JWT Tokens**: 24-hour expiry for web login, 31-day expiry for device login
 - **Auth Middleware**: `auth_middleware` extracts and validates JWT tokens from Authorization Bearer headers, injects
   `AuthUser` into request extensions
-- **User Management**: Configuration files in `faucet_config/` directory:
-    - `banned_domains.txt`: Email domain blacklist
-    - `banned_users.txt`: Individual user email blacklist
-    - `whitelisted_users.txt`: Users exempt from bans
-    - `premium_users.txt`: Users exempt from rate limits
+- **User Management**: SQLite tables in the users database (see "User Lists" below):
+    - `banned_domains`: Email domain blacklist
+    - `banned_users`: Individual user email blacklist
+    - `whitelisted_users`: Users exempt from bans
+    - `premium_users`: Users exempt from rate limits and from bans
 
 ### Rate Limiting (`payments.rs`)
 
@@ -124,13 +124,28 @@ The application uses `tonic_openssl_lnd` for LND gRPC communication. Required en
 The same LND client is used for both Lightning operations (invoices, payments) and on-chain wallet operations (send
 coins, channel opening).
 
-## Configuration Files
+## User Lists
 
-All user management files are read fresh on each request (no caching), located in `faucet_config/`:
+Ban, premium, and whitelist lists are stored in SQLite (`USERS_DB_PATH`, default `users.db`) and cached in memory
+by `UsersCache` (`auth.rs`). The auth middleware checks the cache on every request, so changes apply without a
+restart as long as they go through the admin API.
 
-- Text files with one entry per line
-- Empty lines and whitespace are ignored
-- Email matching is case-insensitive for banned domains
+- Values are trimmed and lowercased on write and on load; matching is case-insensitive
+- A user is banned if their email is in `banned_users` or their domain is in `banned_domains`, unless they are in
+  `whitelisted_users` or `premium_users`
+- Editing the database directly does not update the cache; the change is only seen after a restart
+- `faucet_config/*.txt` files are a legacy format, imported once at startup only into empty tables
+
+### Admin API (`admin.rs`)
+
+`/api/admin/:list` where `:list` is `banned_domains`, `banned_users`, `whitelisted_users`, or `premium_users`.
+Requires `Authorization: Bearer $ADMIN_TOKEN`; returns 404 for all requests if `ADMIN_TOKEN` is unset.
+
+- `GET`: List entries (`{"entries": [...]}`)
+- `POST {"value": "..."}`: Add an entry (idempotent, 201)
+- `DELETE {"value": "..."}`: Remove an entry (200, or 404 if absent)
+
+Writes update both the database and the in-memory cache.
 
 ## Paid Block Reorg Feature
 
