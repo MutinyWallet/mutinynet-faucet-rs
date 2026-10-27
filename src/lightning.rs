@@ -6,8 +6,12 @@ use lnurl::lnurl::LnUrl;
 use lnurl::pay::{LnURLPayInvoice, PayResponse};
 use lnurl::LnUrlResponse;
 use log::info;
-use nostr::prelude::ZapRequestData;
-use nostr::{EventBuilder, Filter, JsonUtil, Kind, Metadata, RelayUrl};
+use nostr::event::{FinalizeEvent, Kind};
+use nostr::filter::Filter;
+use nostr::key::PublicKey;
+use nostr::nips::nip01::Metadata;
+use nostr::nips::nip57::ZapRequestData;
+use nostr::types::RelayUrl;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
@@ -225,13 +229,13 @@ pub async fn pay_lightning(
             }
             _ => anyhow::bail!("invalid lnurl"),
         }
-    } else if let Ok(npub) = nostr::PublicKey::parse(
+    } else if let Ok(npub) = PublicKey::parse(
         bolt11
             .strip_prefix("nostr:")
             .or_else(|| bolt11.strip_prefix("NOSTR:"))
             .unwrap_or(bolt11),
     ) {
-        let client = nostr_sdk::Client::default();
+        let client = nostr_sdk::client::Client::default();
         for relay in RELAYS {
             client.add_relay(relay).await?;
         }
@@ -239,7 +243,8 @@ pub async fn pay_lightning(
 
         let filter = Filter::new().author(npub).kind(Kind::Metadata).limit(1);
         let events = client
-            .fetch_events(filter, std::time::Duration::from_secs(10))
+            .fetch_events(filter)
+            .timeout(std::time::Duration::from_secs(10))
             .await?;
         let event = events
             .into_iter()
@@ -266,7 +271,7 @@ pub async fn pay_lightning(
                 let zap_data = ZapRequestData::new(npub, relays)
                     .lnurl(lnurl.encode())
                     .amount(pay.min_sendable);
-                let zap = EventBuilder::public_zap_request(zap_data).sign_with_keys(&state.keys)?;
+                let zap = zap_data.finalize(&state.keys)?;
 
                 let inv = get_lnurl_invoice(&pay, pay.min_sendable, Some(zap.as_json())).await?;
                 let invoice = Bolt11Invoice::from_str(inv.invoice())

@@ -9,10 +9,15 @@ use lnurl::lightning_address::LightningAddress;
 use lnurl::lnurl::LnUrl;
 use lnurl::LnUrlResponse;
 use log::{error, info, warn};
+use nostr::event::{Event, FinalizeEvent, Kind};
+use nostr::filter::Filter;
+use nostr::key::PublicKey;
+use nostr::nips::nip01::Metadata;
 use nostr::nips::nip04;
-use nostr::prelude::ZapRequestData;
-use nostr::{nips, Event, Filter, JsonUtil, Kind, Metadata, RelayUrl, Timestamp};
-use nostr_sdk::{Client, RelayPoolNotification};
+use nostr::nips::nip57::ZapRequestData;
+use nostr::types::{RelayUrl, Timestamp};
+use nostr_sdk::client::{Client, ClientNotification};
+use nostr_sdk::prelude::StreamExt;
 use std::str::FromStr;
 use tonic_openssl_lnd::lnrpc;
 
@@ -30,7 +35,7 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
     // relay outage or IP ban does not turn into a hot reconnect loop.
     let mut backoff = std::time::Duration::from_secs(1);
     loop {
-        let client = Client::new(state.keys.clone());
+        let client = Client::default();
         for relay in RELAYS {
             client.add_relay(relay).await?;
         }
@@ -41,14 +46,14 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
             .kind(Kind::EncryptedDirectMessage)
             .since(Timestamp::now());
 
-        client.subscribe(filter, None).await?;
+        client.subscribe(filter).await?;
 
         let mut notifications = client.notifications();
 
-        while let Ok(notification) = notifications.recv().await {
+        while let Some(notification) = notifications.next().await {
             backoff = std::time::Duration::from_secs(1);
             match notification {
-                RelayPoolNotification::Event { event, .. } => {
+                ClientNotification::Event { event, .. } => {
                     if event.kind == Kind::EncryptedDirectMessage {
                         info!("Received dm: {}", event.id);
                         tokio::spawn({
@@ -63,11 +68,11 @@ pub async fn listen_to_nostr_dms(state: AppState) -> anyhow::Result<()> {
                         warn!("Received unexpected event: {}", event.id);
                     }
                 }
-                RelayPoolNotification::Shutdown => {
+                ClientNotification::Shutdown => {
                     warn!("Relay pool shutdown");
                     break;
                 }
-                RelayPoolNotification::Message { .. } => {}
+                ClientNotification::Message { .. } => {}
             }
         }
 
@@ -124,7 +129,7 @@ async fn pay_invoice(
     Ok(())
 }
 
-async fn get_lnurl(pubkey: nostr::PublicKey) -> anyhow::Result<LnUrl> {
+async fn get_lnurl(pubkey: PublicKey) -> anyhow::Result<LnUrl> {
     let client = Client::default();
     for relay in RELAYS {
         client.add_relay(relay).await?;
@@ -133,7 +138,8 @@ async fn get_lnurl(pubkey: nostr::PublicKey) -> anyhow::Result<LnUrl> {
 
     let filter = Filter::new().author(pubkey).kind(Kind::Metadata).limit(1);
     let events = client
-        .fetch_events(filter, std::time::Duration::from_secs(10))
+        .fetch_events(filter)
+        .timeout(std::time::Duration::from_secs(10))
         .await?;
     let event = events
         .into_iter()
@@ -154,7 +160,7 @@ async fn get_lnurl(pubkey: nostr::PublicKey) -> anyhow::Result<LnUrl> {
 
 async fn get_invoice(
     lnurl: &LnUrl,
-    pubkey: nostr::PublicKey,
+    pubkey: PublicKey,
     state: &AppState,
 ) -> anyhow::Result<Bolt11Invoice> {
     let invoice = match crate::lightning::make_lnurl_request(&lnurl.url).await? {
@@ -177,9 +183,8 @@ async fn get_invoice(
                 .collect::<Result<Vec<_>, _>>()?;
             let zap_data = ZapRequestData::new(pubkey, relays)
                 .lnurl(lnurl.encode())
-                .amount(amount_msats)
-                .message("This is a private zap 👻");
-            let zap = nips::nip57::private_zap_request(zap_data, &state.keys)?;
+                .amount(amount_msats);
+            let zap = zap_data.finalize(&state.keys)?;
 
             let inv = crate::lightning::get_lnurl_invoice(&pay, amount_msats, Some(zap.as_json()))
                 .await?;
